@@ -1,0 +1,33 @@
+# secrets — 절대 커밋 금지
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# state / runtime (각 컨테이너가 만드는 임시 파일)
+state/
+reports/
+*.log
+
+# 데이터 — 원본 CSV/xlsx는 git에 올리지 않음
+*.csv
+*.xlsx
+*.xls
+# 단 db/seeds/ 안에 있는 건 예외 (테스트용 작은 샘플)
+!db/seeds/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
