@@ -1,0 +1,24 @@
+# 모든 텍스트 파일은 LF 줄바꿈으로 고정 (Windows 로컬 ↔ Linux NAS/컨테이너 호환)
+* text=auto eol=lf
+
+# Python / 코드 파일 명시적 LF
+*.py     text eol=lf
+*.sh     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.toml   text eol=lf
+*.json   text eol=lf
+*.md     text eol=lf
+
+# Dockerfile, .env.example 등도 LF
+Dockerfile text eol=lf
+.env.example text eol=lf
+.gitignore text eol=lf
+
+# 바이너리 파일은 변환 안 함
+*.png    binary
+*.jpg    binary
+*.pdf    binary
+*.xlsx   binary
+*.xls    binary
+*.zip    binary
