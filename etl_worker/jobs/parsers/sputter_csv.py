@@ -9,7 +9,8 @@ Power Source 추론: CSV에는 명시 컬럼 없음. 어느 power 컬럼이 채�
 """
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import text
@@ -18,6 +19,7 @@ from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
 
 log = logging.getLogger("etl.parsers.sputter_csv")
+_KST = ZoneInfo("Asia/Seoul")
 
 # power_source 추론 우선순위 (Pulse가 CW보다 먼저 — Pulse 컬럼 채워졌으면 Pulse)
 _POWER_SOURCE_RULES = [
@@ -254,7 +256,7 @@ def parse_csv(record: SourceFileRecord) -> dict:
                     continue
                 ts = ts.to_pydatetime()
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    ts = ts.replace(tzinfo=_KST)
 
                 # xlsx에 이미 매칭되는 row 있는지 확인
                 match = s.execute(_MATCH_LOOKUP_SQL, {

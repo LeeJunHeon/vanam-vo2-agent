@@ -21,6 +21,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 from sqlalchemy import text
@@ -29,6 +30,7 @@ from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
 
 log = logging.getLogger("etl.parsers.sputter_xlsx")
+_KST = ZoneInfo("Asia/Seoul")
 
 XLSX_MAIN_COLS = [
     '날짜', '담당자', 'Process Name', '비고', '기판',
@@ -52,6 +54,19 @@ XLSX_CLEANING_COLS = [
     'SP Power', 'Avg For.p', 'Avg Ref.p',
     'Avg Load', 'Avg Tune',
 ]
+
+
+def _to_kst(value):
+    """xlsx에서 읽은 naive datetime을 KST aware로 변환.
+
+    openpyxl은 datetime 객체를 timezone 정보 없이 반환하므로
+    운영자가 입력한 KST 시각으로 명시적 인식. None 입력은 None 반환.
+    """
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=_KST)
+    return value
 
 
 def _serialize(v):
@@ -158,7 +173,7 @@ def _build_main_payload(row_dict: dict, source_file_id: int, row_number: int) ->
         'row_number':             row_number,
         'chamber':                'CH1',
         'sample_id':              None,
-        'start_time':             start_time if isinstance(start_time, datetime) else None,
+        'start_time':             _to_kst(start_time),
         'end_time':               None,
         'recipe_name':            _normalize(row_dict.get('Process Name')),
         'operator':               _normalize(row_dict.get('담당자')),
@@ -222,7 +237,7 @@ def _build_cleaning_payload(row_dict: dict, source_file_id: int) -> dict:
     event_time = row_dict.get('날짜')
     return {
         'source_file_id': source_file_id,
-        'event_time':     event_time if isinstance(event_time, datetime) else None,
+        'event_time':     _to_kst(event_time),
         'equipment':      'ch1',
         'chamber':        'CH1',
         'event_type':     'plasma_cleaning',
