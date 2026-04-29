@@ -1,0 +1,42 @@
+# secrets
+.env
+.env.local
+.env.*.local
+
+# git
+.git/
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# state / runtime (컨테이너 내부에서 생성)
+state/
+reports/
+*.log
+
+# 데이터
+*.csv
+*.xlsx
+*.xls
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# docs (이미지 빌드에 불필요)
+*.md
+!README.md
+
+# mcp-server, analysis-worker (etl-worker 빌드에 불필요)
+mcp_server/
+analysis_worker/

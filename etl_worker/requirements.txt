@@ -1,0 +1,8 @@
+# ETL 전용 의존성 (shared 의존성은 root requirements.txt에서)
+
+# 데이터 파싱
+pandas>=2.0,<3.0
+openpyxl>=3.1,<4.0
+
+# 5분 cron scheduler
+apscheduler>=3.10,<4.0
