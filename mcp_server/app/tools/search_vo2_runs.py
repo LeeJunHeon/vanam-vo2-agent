@@ -31,11 +31,11 @@ _SEARCH_SQL = text(
         sr.thickness_nm    AS thickness_nm
     FROM vo2.sputter_runs sr
     WHERE 1=1
-        AND (:chamber      IS NULL OR sr.chamber      = :chamber)
-        AND (:recipe_name  IS NULL OR sr.recipe_name  = :recipe_name)
-        AND (:start_after  IS NULL OR sr.start_time  >= :start_after)
-        AND (:start_before IS NULL OR sr.start_time  <= :start_before)
-        AND (:sample_id    IS NULL OR sr.sputter_run_id = :sample_id)
+        AND (CAST(:chamber AS TEXT)             IS NULL OR sr.chamber         = CAST(:chamber AS TEXT))
+        AND (CAST(:recipe_name AS TEXT)         IS NULL OR sr.recipe_name     = CAST(:recipe_name AS TEXT))
+        AND (CAST(:start_after AS TIMESTAMPTZ)  IS NULL OR sr.start_time     >= CAST(:start_after AS TIMESTAMPTZ))
+        AND (CAST(:start_before AS TIMESTAMPTZ) IS NULL OR sr.start_time     <= CAST(:start_before AS TIMESTAMPTZ))
+        AND (CAST(:sample_id AS TEXT)           IS NULL OR sr.sputter_run_id = CAST(:sample_id AS TEXT))
     ORDER BY sr.start_time DESC NULLS LAST
     LIMIT :limit
     """
