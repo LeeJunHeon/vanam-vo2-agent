@@ -9,6 +9,7 @@ audit insert 실패는 사용자 응답을 막지 않는다 (logger.exception으
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import time
@@ -78,18 +79,34 @@ def _record_audit(
 def audit(tool_name: str) -> Callable:
     """도구 핸들러를 감싸 mcp_audit_logs에 호출 기록.
 
+    FastAPI가 wrapper의 원본 시그니처를 읽을 수 있도록 wrapper.__signature__를
+    명시적으로 설정 (functools.wraps만으로는 부족).
+
+    주의: require_token이 Depends로 적용된 401/403은 핸들러 진입 전에 raise되어
+    audit log에 기록되지 않음 (FastAPI 동작 특성). Phase 3 middleware 전환 시 해결.
+
     성공: success=true, error=NULL
-    HTTPException(401/403): success=false, error=detail
+    도구 내부 HTTPException: success=false, error=detail
     기타 예외: success=false, error=str(e)[:1000]
     """
     def deco(fn: Callable) -> Callable:
+        sig = inspect.signature(fn)
+        param_names = list(sig.parameters)
+        first_param = param_names[0] if param_names else None
+
         @functools.wraps(fn)
-        def wrapper(req: Any, *args: Any, **kwargs: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if args:
+                req = args[0]
+            elif first_param and first_param in kwargs:
+                req = kwargs[first_param]
+            else:
+                req = None
             start = time.time()
             success = True
             err: str | None = None
             try:
-                return fn(req, *args, **kwargs)
+                return fn(*args, **kwargs)
             except HTTPException as e:
                 success = False
                 err = str(e.detail)
@@ -100,7 +117,11 @@ def audit(tool_name: str) -> Callable:
                 raise
             finally:
                 duration_ms = int((time.time() - start) * 1000)
-                args_dict = req.model_dump() if hasattr(req, "model_dump") else {}
+                args_dict = (
+                    req.model_dump()
+                    if (req is not None and hasattr(req, "model_dump"))
+                    else {}
+                )
                 _record_audit(
                     tool_name=tool_name,
                     arguments=args_dict,
@@ -108,5 +129,6 @@ def audit(tool_name: str) -> Callable:
                     error=err,
                     duration_ms=duration_ms,
                 )
+        wrapper.__signature__ = sig  # type: ignore[attr-defined]
         return wrapper
     return deco
