@@ -37,6 +37,5 @@ Thumbs.db
 *.md
 !README.md
 
-# mcp-server, analysis-worker (etl-worker 빌드에 불필요)
-mcp_server/
+# analysis-worker는 Phase 2 이후 빌드 대상이라 현재 컨텍스트에서 제외
 analysis_worker/
