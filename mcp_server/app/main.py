@@ -4,8 +4,11 @@ Phase 1b Step 5-1: /health 엔드포인트만. 도구는 Step 5-4에서 추가.
 """
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
+from mcp_server.app.schemas import SearchVO2RunsRequest, SearchVO2RunsResponse
+from mcp_server.app.security import audit, require_token
+from mcp_server.app.tools import search_vo2_runs
 from shared.config import get_settings
 from shared.logging_config import setup_logging
 
@@ -36,3 +39,13 @@ async def health() -> dict:
         "version": "0.1.0",
         "phase": settings.PHASE,
     }
+
+
+@app.post("/tools/search_vo2_runs", response_model=SearchVO2RunsResponse)
+@audit("search_vo2_runs")
+def _search_vo2_runs(
+    req: SearchVO2RunsRequest,
+    _token: str = Depends(require_token),
+) -> SearchVO2RunsResponse:
+    """sputter_runs 검색 (Phase 1b 첫 도구)."""
+    return search_vo2_runs.run(req)
