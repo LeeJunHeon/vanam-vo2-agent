@@ -163,7 +163,7 @@ def _build_main_payload(row_dict: dict, source_file_id: int, row_number: int) ->
         power_time = avg_power * process_time_min * 60.0
 
     if isinstance(start_time, datetime):
-        sputter_run_id = f"CH1-{start_time.strftime('%Y%m%d-%H%M%S')}"
+        sputter_run_id = f"CH1-{start_time.strftime('%Y%m%d-%H%M%S')}-r{row_number}"
     else:
         sputter_run_id = f"CH1-row-{source_file_id}-{row_number}"
 
