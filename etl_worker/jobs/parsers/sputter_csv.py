@@ -17,6 +17,7 @@ parse_errors도 (source_file_id, row_number, error_type) UNIQUE.
 """
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -49,8 +50,10 @@ NUMERIC_COLUMNS = [
     "DC Pulse: P", "DC Pulse: V", "DC Pulse: I",
     "DC Pulse: Freq", "DC Pulse: Duty Cycle",
     "RF Pulse: For.P", "RF Pulse: Ref.P",
-    "Shutter Delay", "Chuck Position",
+    "Shutter Delay",
 ]
+# Note: Chuck Position 제거 (Step 4-fix6) — DB schema는 chuck_position TEXT로,
+# sputter program이 'down'/'mid' 같은 위치값을 정상 입력. 숫자 변환 대상 아님.
 
 
 # ─────────────────────────── 헬퍼 ───────────────────────────
@@ -86,6 +89,26 @@ def _to_float(v):
         return float(s)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_for_json(value):
+    """JSON 직렬화 안전 변환. NaN/None은 None, 나머지는 strip된 문자열.
+
+    pd.isna()만으로는 numpy.NaN이 누수될 수 있으므로 isinstance + math.isnan
+    명시 체크 추가. PostgreSQL JSONB는 'NaN' 토큰을 거부하므로 raw_data 직렬화 전
+    필수 sanitize. (Step 4-fix6)
+    """
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    return s if s else None
 
 
 def _serialize(v):
@@ -393,7 +416,7 @@ def parse_csv(record: SourceFileRecord) -> dict:
             for offset, (_, row) in enumerate(new_rows.iterrows()):
                 row_number = prev_row_count + offset
                 # raw_data용 dict — _ts_parsed (derived) 제거
-                row_dict = {k: v for k, v in row.to_dict().items() if k != '_ts_parsed'}
+                row_dict = {k: _safe_for_json(v) for k, v in row.to_dict().items() if k != '_ts_parsed'}
 
                 try:
                     parse_errors_to_record = []  # list[(error_type, error_detail)]
