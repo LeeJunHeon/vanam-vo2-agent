@@ -1,3 +1,4 @@
 # MCP server 전용 의존성 (shared 의존성은 top-level requirements.txt에서)
 fastapi>=0.115,<0.120
 uvicorn[standard]>=0.30,<0.40
+mcp>=1.27,<2.0

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from fastapi import Depends, FastAPI
 
+from mcp_server.app.main_mcp import mcp_app
 from mcp_server.app.schemas import SearchVO2RunsRequest, SearchVO2RunsResponse
 from mcp_server.app.security import AuditMiddleware, require_token
 from mcp_server.app.tools import search_vo2_runs
@@ -24,6 +25,10 @@ app = FastAPI(
 
 # 모든 /tools/* 호출을 vo2.mcp_audit_logs에 기록
 app.add_middleware(AuditMiddleware)
+
+# Streamable HTTP MCP endpoint (ChatGPT custom connector용)
+# AuditMiddleware는 현재 /tools/만 잡음 — Step 7에서 /mcp도 audit 잡도록 확장 예정
+app.mount("/mcp", mcp_app)
 
 
 @app.on_event("startup")
