@@ -36,6 +36,7 @@ class Settings(BaseSettings):
 
     # MCP server 인증 토큰 (32자 이상 hex)
     INTERNAL_API_TOKEN: SecretStr
+    CHATGPT_API_TOKEN: SecretStr | None = None
 
     # 로그 / CORS / Phase
     LOG_LEVEL: str = "INFO"
