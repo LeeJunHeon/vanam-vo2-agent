@@ -39,6 +39,18 @@ def _normalize(v):
     return v
 
 
+def _to_float(v):
+    """숫자 변환 시도, 실패하면 None.
+    CSV에 'T'/'F' 같은 문자가 숫자 컬럼에 들어오는 경우 안전 처리.
+    """
+    if v is None or pd.isna(v) or v == '':
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _serialize(v):
     """JSON 직렬화 — datetime → ISO, NaN → None."""
     if pd.isna(v):
@@ -119,10 +131,10 @@ _UPDATE_SOURCE_FILES_SQL = text("""
 def _build_csv_payload(row: dict, source_file_id: int, row_number: int,
                        timestamp: datetime) -> dict:
     """CSV row → sputter_runs INSERT payload (xlsx 보강용, 정보 일부 미포함)."""
-    ar = _normalize(row.get('Ar flow'))
-    o2 = _normalize(row.get('O2 flow'))
-    n2 = _normalize(row.get('N2 flow'))
-    process_time_min = _normalize(row.get('Process Time'))
+    ar = _to_float(row.get('Ar flow'))
+    o2 = _to_float(row.get('O2 flow'))
+    n2 = _to_float(row.get('N2 flow'))
+    process_time_min = _to_float(row.get('Process Time'))
     power_source = _infer_power_source(row)
 
     # power_source에 따라 대표 컬럼 매핑
@@ -135,24 +147,24 @@ def _build_csv_payload(row: dict, source_file_id: int, row_number: int,
     pulse_duty = None
 
     if power_source == 'DC':
-        avg_power = _normalize(row.get('DC: P'))
-        avg_voltage = _normalize(row.get('DC: V'))
-        avg_current = _normalize(row.get('DC: I'))
+        avg_power = _to_float(row.get('DC: P'))
+        avg_voltage = _to_float(row.get('DC: V'))
+        avg_current = _to_float(row.get('DC: I'))
     elif power_source == 'RF':
-        avg_for_p = _normalize(row.get('RF: For.P'))
-        avg_ref_p = _normalize(row.get('RF: Ref. P'))
+        avg_for_p = _to_float(row.get('RF: For.P'))
+        avg_ref_p = _to_float(row.get('RF: Ref. P'))
     elif power_source == 'RF Pulse':
-        avg_power = _normalize(row.get('RF Pulse: P'))
-        avg_for_p = _normalize(row.get('RF Pulse: For.P'))
-        avg_ref_p = _normalize(row.get('RF Pulse: Ref.P'))
-        pulse_freq = _normalize(row.get('RF Pulse: Freq'))
-        pulse_duty = _normalize(row.get('RF Pulse: Duty Cycle'))
+        avg_power = _to_float(row.get('RF Pulse: P'))
+        avg_for_p = _to_float(row.get('RF Pulse: For.P'))
+        avg_ref_p = _to_float(row.get('RF Pulse: Ref.P'))
+        pulse_freq = _to_float(row.get('RF Pulse: Freq'))
+        pulse_duty = _to_float(row.get('RF Pulse: Duty Cycle'))
     elif power_source == 'DC Pulse':
-        avg_power = _normalize(row.get('DC Pulse: P'))
-        avg_voltage = _normalize(row.get('DC Pulse: V'))
-        avg_current = _normalize(row.get('DC Pulse: I'))
-        pulse_freq = _normalize(row.get('DC Pulse: Freq'))
-        pulse_duty = _normalize(row.get('DC Pulse: Duty Cycle'))
+        avg_power = _to_float(row.get('DC Pulse: P'))
+        avg_voltage = _to_float(row.get('DC Pulse: V'))
+        avg_current = _to_float(row.get('DC Pulse: I'))
+        pulse_freq = _to_float(row.get('DC Pulse: Freq'))
+        pulse_duty = _to_float(row.get('DC Pulse: Duty Cycle'))
 
     # 파생값
     o2_ratio = None
@@ -186,16 +198,16 @@ def _build_csv_payload(row: dict, source_file_id: int, row_number: int,
         'power_select':           _normalize(row.get('Power Select')),
         'main_shutter_open':      row.get('Main Shutter') == 'T',
         'chuck_position':         _normalize(row.get('Chuck Position')),
-        'shutter_delay_min':      _normalize(row.get('Shutter Delay')),
+        'shutter_delay_min':      _to_float(row.get('Shutter Delay')),
         'process_time_min':       process_time_min,
-        'integration_time_s':     _normalize(row.get('Integration Time')),
+        'integration_time_s':     _to_float(row.get('Integration Time')),
         'sp_ar_sccm':             None,
         'sp_o2_sccm':             None,
         'sp_n2_sccm':             None,
         'sp_pressure_mtorr':      None,
         'sp_power_w':             None,
-        'base_pressure_torr':     _normalize(row.get('Base Pressure')),
-        'avg_pressure_mtorr':     _normalize(row.get('Working Pressure')),
+        'base_pressure_torr':     _to_float(row.get('Base Pressure')),
+        'avg_pressure_mtorr':     _to_float(row.get('Working Pressure')),
         'avg_ar_sccm':            ar,
         'avg_o2_sccm':            o2,
         'avg_n2_sccm':            n2,
@@ -247,48 +259,69 @@ def parse_csv(record: SourceFileRecord) -> dict:
         df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
         new_rows = df.iloc[prev_row_count:]
 
+        row_errors = 0
         with session_scope_writer() as s:
             for offset, (_, row) in enumerate(new_rows.iterrows()):
                 row_number = prev_row_count + offset
-                ts = row['Timestamp']
-                if pd.isna(ts):
-                    log.warning(f"row {row_number}: Timestamp 파싱 실패, skip")
-                    continue
-                ts = ts.to_pydatetime()
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=_KST)
+                try:
+                    ts = row['Timestamp']
+                    if pd.isna(ts):
+                        log.warning(f"row {row_number}: Timestamp 파싱 실패, skip")
+                        continue
+                    ts = ts.to_pydatetime()
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=_KST)
 
-                # xlsx에 이미 매칭되는 row 있는지 확인
-                match = s.execute(_MATCH_LOOKUP_SQL, {
-                    "ch": "CH1",
-                    "lo": ts - timedelta(seconds=_MATCH_TOLERANCE_SECONDS),
-                    "hi": ts + timedelta(seconds=_MATCH_TOLERANCE_SECONDS),
-                }).first()
-                if match is not None:
-                    skipped += 1
-                    continue
+                    # xlsx에 이미 매칭되는 row 있는지 확인
+                    match = s.execute(_MATCH_LOOKUP_SQL, {
+                        "ch": "CH1",
+                        "lo": ts - timedelta(seconds=_MATCH_TOLERANCE_SECONDS),
+                        "hi": ts + timedelta(seconds=_MATCH_TOLERANCE_SECONDS),
+                    }).first()
+                    if match is not None:
+                        skipped += 1
+                        continue
 
-                payload = _build_csv_payload(
-                    row.to_dict(), record.id, row_number, ts
-                )
-                s.execute(_INSERT_CSV_SQL, payload)
-                inserted += 1
+                    payload = _build_csv_payload(
+                        row.to_dict(), record.id, row_number, ts
+                    )
+                    # savepoint로 한 row 실패가 전체 transaction rollback하지 않도록
+                    savepoint = s.begin_nested()
+                    try:
+                        s.execute(_INSERT_CSV_SQL, payload)
+                        savepoint.commit()
+                        inserted += 1
+                    except Exception as row_e:
+                        savepoint.rollback()
+                        row_errors += 1
+                        log.warning(
+                            f"row {row_number} insert failed (data error): "
+                            f"{type(row_e).__name__}: {str(row_e)[:200]}"
+                        )
+                except Exception as outer_e:
+                    row_errors += 1
+                    log.warning(
+                        f"row {row_number} skipped (parse error): "
+                        f"{type(outer_e).__name__}: {str(outer_e)[:200]}"
+                    )
 
             s.execute(_UPDATE_SOURCE_FILES_SQL, {
                 "id": record.id,
                 "row_count": prev_row_count + len(new_rows),
-                "parser_status": "ok",
-                "parser_error": None,
+                "parser_status": "ok" if row_errors == 0 else "partial",
+                "parser_error": None if row_errors == 0 else f"{row_errors} rows skipped due to data errors",
             })
 
         log.info(
             f"csv {record.file_name}: +{inserted} inserted, "
-            f"{skipped} skipped (xlsx-matched), {len(new_rows)} new rows scanned"
+            f"{skipped} skipped (xlsx-matched), {row_errors} errors, "
+            f"{len(new_rows)} new rows scanned"
         )
         return {
-            "inserted": inserted,
-            "skipped":  skipped,
-            "status":   "ok",
+            "inserted":   inserted,
+            "skipped":    skipped,
+            "row_errors": row_errors,
+            "status":     "ok" if row_errors == 0 else "partial",
         }
 
     except Exception as e:
