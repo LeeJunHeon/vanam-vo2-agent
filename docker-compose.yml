@@ -1,0 +1,26 @@
+name: vo2-agent
+
+services:
+  vo2-etl-worker:
+    build:
+      context: .
+      dockerfile: etl_worker/Dockerfile
+    container_name: vo2-etl-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=Asia/Seoul
+    networks:
+      - vanam-db-net
+    volumes:
+      # SMB 원본 폴더 (read-only mount, ETL은 절대 수정/삭제하지 않음)
+      - /volume1/VanaM_Sputter:/data:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  vanam-db-net:
+    external: true
