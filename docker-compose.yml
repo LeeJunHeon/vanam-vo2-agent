@@ -6,6 +6,7 @@ services:
       context: .
       dockerfile: etl_worker/Dockerfile
     container_name: vo2-etl-worker
+    user: "0:0"
     restart: unless-stopped
     env_file: .env
     environment:
