@@ -1,13 +1,14 @@
 """vo2-mcp-server entry point.
 
-Phase 1b Step 5-1: /health 엔드포인트만. 도구는 Step 5-4에서 추가.
+Phase 1b Step 5-4: /health + /tools/search_vo2_runs.
+audit은 AuditMiddleware로 처리 (security.py).
 """
 from __future__ import annotations
 
 from fastapi import Depends, FastAPI
 
 from mcp_server.app.schemas import SearchVO2RunsRequest, SearchVO2RunsResponse
-from mcp_server.app.security import audit, require_token
+from mcp_server.app.security import AuditMiddleware, require_token
 from mcp_server.app.tools import search_vo2_runs
 from shared.config import get_settings
 from shared.logging_config import setup_logging
@@ -21,6 +22,9 @@ app = FastAPI(
     description="VO2 Sputter MCP server (Phase 1b)",
 )
 
+# 모든 /tools/* 호출을 vo2.mcp_audit_logs에 기록
+app.add_middleware(AuditMiddleware)
+
 
 @app.on_event("startup")
 async def on_startup() -> None:
@@ -32,7 +36,7 @@ async def on_startup() -> None:
 
 @app.get("/health")
 async def health() -> dict:
-    """liveness probe — DB 연결은 검사하지 않음 (Step 5-4 이후 readiness 별도)."""
+    """liveness probe — DB 연결은 검사하지 않음."""
     return {
         "status": "ok",
         "service": "vo2-mcp-server",
@@ -42,10 +46,9 @@ async def health() -> dict:
 
 
 @app.post("/tools/search_vo2_runs", response_model=SearchVO2RunsResponse)
-@audit("search_vo2_runs")
 def _search_vo2_runs(
     req: SearchVO2RunsRequest,
     _token: str = Depends(require_token),
 ) -> SearchVO2RunsResponse:
-    """sputter_runs 검색 (Phase 1b 첫 도구)."""
+    """sputter_runs 검색 (Phase 1b 첫 도구). audit은 AuditMiddleware가 처리."""
     return search_vo2_runs.run(req)
