@@ -21,7 +21,7 @@ git pull
 export BUILDX_GIT_INFO=0
 
 # 3. 빌드 + 정지 + 시작 (서비스별로 반복)
-SERVICES=("vo2-etl-worker")
+SERVICES=("vo2-etl-worker" "vo2-mcp-server")
 # MCP server 추가 시: SERVICES=("vo2-etl-worker" "vo2-mcp-server")
 
 for SERVICE in "${SERVICES[@]}"; do
