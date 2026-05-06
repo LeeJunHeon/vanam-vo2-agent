@@ -19,7 +19,12 @@ from shared.logging_config import setup_logging
 
 log = setup_logging("mcp_server.main_mcp")
 
-mcp = FastMCP("vo2-mcp-server", stateless_http=True)
+mcp = FastMCP(
+    "vo2-mcp-server",
+    stateless_http=True,
+    streamable_http_path="/",
+    json_response=True,
+)
 
 
 @mcp.tool()
