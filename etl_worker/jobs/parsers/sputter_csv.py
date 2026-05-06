@@ -112,14 +112,20 @@ def _infer_power_source(row: dict):
 
 
 def _detect_suspicious_columns(row: dict) -> list:
-    """숫자 컬럼에 'T'/'F' 외 변환 불가 값이 있으면 의심 컬럼 목록 반환."""
+    """숫자 컬럼에 변환 불가 값이 있으면 의심 컬럼 목록 반환.
+
+    NUMERIC_COLUMNS는 모두 숫자가 와야 정상인 컬럼들. 'T'/'F' 같은 boolean
+    문자가 들어오는 것 자체가 column_shift 신호이므로 면제 안 함.
+    (boolean이 정상인 컬럼 main_shutter_open / target_cleaning_flag 등은
+    애초에 NUMERIC_COLUMNS에 포함돼 있지 않음.)
+    """
     suspicious = []
     for col in NUMERIC_COLUMNS:
         raw = row.get(col)
         if _is_na(raw):
             continue
         s = str(raw).strip()
-        if s == "" or s.upper() in ("T", "F", "TRUE", "FALSE"):
+        if s == "":
             continue
         try:
             float(s)
