@@ -36,4 +36,6 @@ EXPOSE 8000
 
 CMD ["uvicorn", "mcp_server.app.main:app", \
      "--host", "0.0.0.0", "--port", "8000", \
-     "--log-level", "info"]
+     "--log-level", "info", \
+     "--proxy-headers", \
+     "--forwarded-allow-ips", "*"]

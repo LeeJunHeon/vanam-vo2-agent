@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.streamable_http import TransportSecuritySettings
 
 from mcp_server.app.schemas import SearchVO2RunsRequest
 from mcp_server.app.tools import search_vo2_runs as _search_tool
@@ -24,6 +25,23 @@ mcp = FastMCP(
     stateless_http=True,
     streamable_http_path="/",
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*",
+            "vo2-mcp.vanam.synology.me",
+            "vo2-mcp.vanam.synology.me:*",
+        ],
+        allowed_origins=[
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            "https://vo2-mcp.vanam.synology.me",
+            "https://vo2-mcp.vanam.synology.me:*",
+        ],
+    ),
 )
 
 
