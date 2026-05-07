@@ -15,7 +15,12 @@ services:
       - vanam-db-net
     volumes:
       # SMB 원본 폴더 (read-only mount, ETL은 절대 수정/삭제하지 않음)
+      # Sputter chamber 1 — 사람 입력 로그 + 자동 CH1.xlsx + RGA
       - /volume1/VanaM_Sputter:/data:ro
+      # ALD 장비 데이터 (NCD + Rayvac)
+      - /volume1/VanaM_ALD:/data_ald:ro
+      # VO2 측정 데이터 (.dat 트리)
+      - /volume1/VanaM_VO2:/data_vo2:ro
     logging:
       driver: json-file
       options:

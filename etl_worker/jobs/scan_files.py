@@ -23,17 +23,45 @@ from shared.db import session_scope_writer
 
 log = logging.getLogger("etl.scan_files")
 
-# Phase 1b 한정 — CH1 두 파일만. Phase 2부터 OES, ALD recipe, anneal, measurement 추가.
+# Phase 4 Step 12 — 데이터 source 6종.
+# 신규 source_type 4종은 아직 파서 없음 → sync_sputter.py에서 무시.
+# Phase 4 Step 13~18에서 각 파서 추가.
+#
+# 마운트 매핑 (docker-compose volumes):
+#   /data       ← /volume1/VanaM_Sputter
+#   /data_ald   ← /volume1/VanaM_ALD
+#   /data_vo2   ← /volume1/VanaM_VO2
+#
+# 측정 .dat (5번)은 폴더 트리 traversal이 필요해 별도 파서 (measurement_dat).
+# SOURCE_FILES는 단일 파일 인덱싱만 다루므로 측정은 여기서 제외, Step 17에서 처리.
 SOURCE_FILES: list[dict] = [
+    # ───── ALD (Phase 4 Step 13) ─────────────────────────────────────
     {
-        "source_type": "sputter_csv",
-        "chamber":     "CH1",
-        "file_path":   "/data/Sputter/Calib/Database/Ch1_log.csv",
+        "source_type": "ald_ncd_xlsx",
+        "chamber": None,                          # ALD는 chamber 무관
+        "file_path": "/data_ald/측정 Data/NCD/TiO2/TIO2 레시피, 데이터 정리_베이지안_측정용 (4)의 복사본.xlsx",
     },
     {
-        "source_type": "sputter_xlsx",
-        "chamber":     "CH1",
-        "file_path":   "/data/Process_log/CH1.xlsx",
+        "source_type": "ald_rayvac_xlsx",
+        "chamber": None,
+        "file_path": "/data_ald/측정 Data/Rayvac/TiO2/tio2두께 정리_260429.xlsx",
+    },
+    # ───── Sputter (Phase 4 Step 15-16) ──────────────────────────────
+    {
+        "source_type": "sputter_human_xlsx",      # 사람 입력 — 마스터
+        "chamber": "CH1",
+        "file_path": "/data/Ch1 process log (1).xlsx",
+    },
+    {
+        "source_type": "sputter_auto_xlsx",       # 자동 — 보강
+        "chamber": "CH1",
+        "file_path": "/data/Process_log/CH1.xlsx",
+    },
+    # ───── RGA (Phase 4 Step 18) ─────────────────────────────────────
+    {
+        "source_type": "rga_csv",
+        "chamber": "CH1",
+        "file_path": "/data/RGA/Ch.1/RGA_spectrums.csv",
     },
 ]
 
