@@ -18,6 +18,7 @@ from etl_worker.jobs.scan_files import scan_all
 from etl_worker.jobs.parsers.sputter_xlsx import parse_xlsx
 from etl_worker.jobs.parsers.sputter_csv import parse_csv
 from etl_worker.jobs.parsers.ald_ncd import parse_ald_ncd
+from etl_worker.jobs.parsers.ald_rayvac import parse_ald_rayvac
 
 log = logging.getLogger("etl.sync_sputter")
 
@@ -73,6 +74,7 @@ def sync_all() -> dict:
         xlsx_records = [r for r in records if r.source_type == "sputter_xlsx"]
         csv_records = [r for r in records if r.source_type == "sputter_csv"]
         ald_ncd_records = [r for r in records if r.source_type == "ald_ncd_xlsx"]
+        ald_rayvac_records = [r for r in records if r.source_type == "ald_rayvac_xlsx"]
 
         for rec in xlsx_records:
             result = parse_xlsx(rec)
@@ -98,6 +100,14 @@ def sync_all() -> dict:
                     result.get("ttip_inserted", 0)
                     + result.get("tdmat_inserted", 0)
                 )
+
+        # ALD Rayvac (Phase 4 Step 14)
+        for rec in ald_rayvac_records:
+            result = parse_ald_rayvac(rec)
+            parser_results.append({"file": rec.file_name, **result})
+            if result["status"] == "ok":
+                files_processed += 1
+                rows_inserted += result.get("inserted", 0)
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
