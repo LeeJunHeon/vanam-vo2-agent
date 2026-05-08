@@ -144,7 +144,7 @@ _INSERT_NCD_SQL = text("""
         :gpc_a_per_cycle, :avg_max_min_pct,
         :source_file_id, :row_number, CAST(:raw_json AS JSONB), :parse_status
     )
-    ON CONFLICT (source_file_id, row_number) DO NOTHING
+    ON CONFLICT (source_file_id, chemistry, row_number) DO NOTHING
 """)
 
 _INSERT_PARSE_ERROR_SQL = text("""

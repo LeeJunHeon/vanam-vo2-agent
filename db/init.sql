@@ -76,7 +76,8 @@ ALTER TABLE vo2.sputter_runs ADD COLUMN IF NOT EXISTS parse_status TEXT;
 -- ─────── 1. ald_ncd_runs (NCD 전용, oxidant H2O) ─────────────────────────
 -- NCD xlsx의 "레시피 및 결과(TTIP)" / "(TDMAT)" 시트의 한 row = 한 batch.
 -- batch_no는 시트 내 자체 일련번호. 같은 batch_no가 여러 row일 수 있음 (재공정 케이스 — xlsx 그대로 보존).
--- UNIQUE는 xlsx 위치 (source_file_id, row_number). (chemistry, batch_no)는 검색용 INDEX.
+-- UNIQUE는 (source_file_id, chemistry, row_number) — 두 시트(TTIP/TDMAT)가 같은 row_number 공유하므로 chemistry 필수.
+-- (chemistry, batch_no)는 검색용 INDEX.
 CREATE TABLE IF NOT EXISTS vo2.ald_ncd_runs (
     ald_run_id BIGSERIAL PRIMARY KEY,
     batch_no INTEGER NOT NULL,
@@ -116,7 +117,7 @@ CREATE TABLE IF NOT EXISTS vo2.ald_ncd_runs (
     parse_status TEXT,                   -- NULL=clean, 'partial' 등
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT uq_ald_ncd_runs UNIQUE (source_file_id, row_number)
+    CONSTRAINT uq_ald_ncd_runs UNIQUE (source_file_id, chemistry, row_number)
 );
 CREATE INDEX IF NOT EXISTS idx_ald_ncd_runs_date ON vo2.ald_ncd_runs (process_date DESC);
 CREATE INDEX IF NOT EXISTS idx_ald_ncd_runs_batch ON vo2.ald_ncd_runs (chemistry, batch_no);
