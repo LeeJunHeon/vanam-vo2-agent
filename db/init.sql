@@ -75,7 +75,8 @@ ALTER TABLE vo2.sputter_runs ADD COLUMN IF NOT EXISTS parse_status TEXT;
 
 -- ─────── 1. ald_ncd_runs (NCD 전용, oxidant H2O) ─────────────────────────
 -- NCD xlsx의 "레시피 및 결과(TTIP)" / "(TDMAT)" 시트의 한 row = 한 batch.
--- batch_no는 시트 내 자체 일련번호. TTIP/TDMAT는 안 겹침 (TTIP 18~240, TDMAT 241+).
+-- batch_no는 시트 내 자체 일련번호. 같은 batch_no가 여러 row일 수 있음 (재공정 케이스 — xlsx 그대로 보존).
+-- UNIQUE는 xlsx 위치 (source_file_id, row_number). (chemistry, batch_no)는 검색용 INDEX.
 CREATE TABLE IF NOT EXISTS vo2.ald_ncd_runs (
     ald_run_id BIGSERIAL PRIMARY KEY,
     batch_no INTEGER NOT NULL,
@@ -115,14 +116,15 @@ CREATE TABLE IF NOT EXISTS vo2.ald_ncd_runs (
     parse_status TEXT,                   -- NULL=clean, 'partial' 등
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT uq_ald_ncd_runs UNIQUE (chemistry, batch_no)
+    CONSTRAINT uq_ald_ncd_runs UNIQUE (source_file_id, row_number)
 );
 CREATE INDEX IF NOT EXISTS idx_ald_ncd_runs_date ON vo2.ald_ncd_runs (process_date DESC);
-CREATE INDEX IF NOT EXISTS idx_ald_ncd_runs_batch ON vo2.ald_ncd_runs (batch_no);
+CREATE INDEX IF NOT EXISTS idx_ald_ncd_runs_batch ON vo2.ald_ncd_runs (chemistry, batch_no);
 
 -- ─────── 2. ald_rayvac_runs (Rayvac 전용, oxidant O3) ─────────────────────
 -- Rayvac xlsx의 "공정 레시피 & 결과 정리" 시트의 한 row = 한 batch.
 -- batch_no는 시트 내 자체 일련번호. NCD와는 별개 시리즈.
+-- UNIQUE는 xlsx 위치 (source_file_id, row_number)로 일관성 유지 (NCD 패턴과 동일).
 CREATE TABLE IF NOT EXISTS vo2.ald_rayvac_runs (
     ald_run_id BIGSERIAL PRIMARY KEY,
     batch_no INTEGER NOT NULL,
@@ -164,7 +166,7 @@ CREATE TABLE IF NOT EXISTS vo2.ald_rayvac_runs (
     parse_status TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT uq_ald_rayvac_runs UNIQUE (batch_no)
+    CONSTRAINT uq_ald_rayvac_runs UNIQUE (source_file_id, row_number)
 );
 CREATE INDEX IF NOT EXISTS idx_ald_rayvac_runs_date ON vo2.ald_rayvac_runs (process_date DESC);
 CREATE INDEX IF NOT EXISTS idx_ald_rayvac_runs_batch ON vo2.ald_rayvac_runs (batch_no);
