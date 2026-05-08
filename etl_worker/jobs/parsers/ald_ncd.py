@@ -13,7 +13,7 @@ NCD xlsx 구조:
 - 검증 실패 row → parse_errors 격리 (GPT 친화 자연어 메시지)
 
 멱등성:
-- ald_ncd_runs UNIQUE (source_file_id, row_number) → ON CONFLICT DO NOTHING
+- ald_ncd_runs UNIQUE (source_file_id, chemistry, row_number) → ON CONFLICT DO NOTHING
 - parse_errors UNIQUE (source_file_id, row_number, error_type) → ON CONFLICT DO NOTHING
 """
 
