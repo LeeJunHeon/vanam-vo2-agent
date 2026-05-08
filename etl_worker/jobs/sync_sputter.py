@@ -14,6 +14,9 @@ source_type 매핑:
 - ald_ncd_xlsx       → parse_ald_ncd       → ald_ncd_runs
 - ald_rayvac_xlsx    → parse_ald_rayvac    → ald_rayvac_runs
 - rga_csv            → (RGA 파서 미래)
+
+별도 트리 traversal (source_files 안 거침):
+- VO2 측정 .dat 트리 → parse_measurements_tree → measurements
 """
 
 import json
@@ -28,6 +31,7 @@ from etl_worker.jobs.parsers.ald_ncd import parse_ald_ncd
 from etl_worker.jobs.parsers.ald_rayvac import parse_ald_rayvac
 from etl_worker.jobs.parsers.sputter_human import parse_sputter_human
 from etl_worker.jobs.parsers.sputter_auto import parse_sputter_auto
+from etl_worker.jobs.parsers.measurement_dat import parse_measurements_tree
 
 log = logging.getLogger("etl.sync_sputter")
 
@@ -117,6 +121,14 @@ def sync_all() -> dict:
             if result["status"] == "ok":
                 files_processed += 1
                 rows_inserted += result.get("inserted", 0)
+
+        # 측정 .dat 트리 traversal (Phase 4 Step 17)
+        # source_files 인덱싱 안 거치고 자체 traversal — file_path UNIQUE로 멱등성
+        meas_result = parse_measurements_tree()
+        parser_results.append({"file": "measurements_tree", **meas_result})
+        if meas_result["status"] == "ok":
+            files_processed += meas_result.get("files_inserted", 0)
+            rows_inserted += meas_result.get("files_inserted", 0)
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
