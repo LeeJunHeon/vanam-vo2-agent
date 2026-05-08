@@ -73,7 +73,7 @@ class SourceFileRecord:
     """한 source 파일의 인덱싱 결과 — parser들이 받아서 처리 여부 결정."""
     id: int
     source_type: str
-    chamber: str
+    chamber: Optional[str]  # ALD 등 chamber 무관 source는 None
     file_path: Path
     file_name: str
     sha256: str
@@ -133,11 +133,19 @@ def _scan_one(spec: dict, grace_seconds: int) -> Optional[SourceFileRecord]:
     sha = _compute_sha256(p)
     race_unsafe = _is_race_unsafe(mtime, grace_seconds)
 
+    # ALD 등 chamber 무관 source는 None 가능. 안전 처리.
+    chamber = spec.get("chamber")
+    if chamber:
+        equipment = chamber.lower()
+    else:
+        # source_type prefix를 equipment로 (ald_ncd_xlsx → 'ald', rga_csv → 'rga')
+        equipment = spec["source_type"].split("_")[0]
+
     with session_scope_writer() as s:
         row = s.execute(_UPSERT_SQL, {
             "source_type": spec["source_type"],
-            "equipment":   spec["chamber"].lower(),
-            "chamber":     spec["chamber"],
+            "equipment":   equipment,
+            "chamber":     chamber,
             "file_path":   str(p),
             "file_name":   p.name,
             "file_ext":    p.suffix.lstrip("."),
@@ -153,7 +161,7 @@ def _scan_one(spec: dict, grace_seconds: int) -> Optional[SourceFileRecord]:
     return SourceFileRecord(
         id=row[0],
         source_type=spec["source_type"],
-        chamber=spec["chamber"],
+        chamber=chamber,
         file_path=p,
         file_name=p.name,
         sha256=sha,
