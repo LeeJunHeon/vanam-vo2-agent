@@ -29,6 +29,11 @@
   R1: 헤더 ("Temp   Resistance")
   R2~: 두 컬럼 (탭/공백 구분), 과학 표기
   ASCII, CRLF
+
+실패 row 정책 (Phase 4 Step 17 fix):
+  - savepoint(begin_nested)로 한 row 실패가 batch 나머지에 영향 안 줌
+  - 실패 row도 메타는 INSERT (시계열 NULL, parse_status='error', raw_header에 에러 메시지)
+  - 데이터 유실 0 — 운영자/agent가 SELECT WHERE parse_status='error'로 조회 가능
 """
 
 import hashlib
@@ -119,18 +124,13 @@ def _parse_dat_content(file_path: Path) -> tuple[str, list, list]:
 
 
 def _extract_folder_meta(file_path: Path) -> tuple[Optional[int], Optional[date], Optional[int]]:
-    """파일 경로에서 (year, measurement_date, process_seq) 추출.
-
-    /data_vo2/VO2 data (NAS)/data/2026/20260506/1/file.dat
-                                  ^^^^ ^^^^^^^^ ^
-                                  year date     seq
-    """
+    """파일 경로에서 (year, measurement_date, process_seq) 추출."""
     try:
         rel = file_path.relative_to(MEASUREMENT_ROOT)
     except ValueError:
         return (None, None, None)
 
-    parts = rel.parts  # ('2026', '20260506', '1', 'file.dat') 등
+    parts = rel.parts
 
     year = None
     measurement_date = None
@@ -151,7 +151,7 @@ def _extract_folder_meta(file_path: Path) -> tuple[Optional[int], Optional[date]
 
     # 직속 부모가 1~3자리 숫자면 공정 순번
     if len(parts) >= 3:
-        parent = parts[-2]  # 파일의 직속 부모
+        parent = parts[-2]
         if parent.isdigit() and len(parent) <= 3:
             process_seq = int(parent)
 
@@ -160,16 +160,6 @@ def _extract_folder_meta(file_path: Path) -> tuple[Optional[int], Optional[date]
 
 def _extract_filename_meta(file_name: str, suffix_n: int) -> dict:
     """파일명에서 process_seq_in_name, sample_seq, sub_label/kind/batch 추출.
-
-    "1-1-ncd(236)_p_big-F_0.10V_0.dat" (suffix_n=0)
-       ↓
-    {
-      'process_seq_in_name': 1,
-      'sample_seq': 1,
-      'sub_label_raw': 'ncd(236)',
-      'sub_kind': 'ncd',
-      'sub_batch_no': 236,
-    }
 
     매칭 실패한 부분은 NULL.
     """
@@ -222,7 +212,6 @@ def _discover_dat_files(base_path: Path) -> list[tuple[Path, str, int]]:
     candidates = []
 
     for dirpath, dirnames, filenames in os.walk(base_path):
-        # 폴더 안 .dat 파일들을 base별로 그룹화
         groups = {}  # base → (max_n, filename)
         for fname in filenames:
             m = SUFFIX_RE.match(fname)
@@ -238,11 +227,49 @@ def _discover_dat_files(base_path: Path) -> list[tuple[Path, str, int]]:
             if existing is None or existing[0] < n:
                 groups[base] = (n, fname)
 
-        # 그룹별 max만 candidates에 추가
         for base, (n, fname) in groups.items():
             candidates.append((Path(dirpath) / fname, base, n))
 
     return candidates
+
+
+def _build_payload(
+    file_path: Path,
+    suffix_n: int,
+    sha: str,
+    file_size: Optional[int],
+    file_mtime: Optional[datetime],
+    raw_header: str,
+    temps: list,
+    resistances: list,
+    parse_status: str,
+) -> dict:
+    """공통 payload 구성. 정상/에러 모두 사용."""
+    year, measurement_date, process_seq = _extract_folder_meta(file_path)
+    fname_meta = _extract_filename_meta(file_path.name, suffix_n)
+
+    return {
+        'file_path': str(file_path),
+        'file_name': file_path.name,
+        'file_dir': str(file_path.parent),
+        'year': year,
+        'measurement_date': measurement_date,
+        'process_seq': process_seq,
+        'process_seq_in_name': fname_meta['process_seq_in_name'],
+        'sample_seq': fname_meta['sample_seq'],
+        'sub_label_raw': fname_meta['sub_label_raw'],
+        'sub_kind': fname_meta['sub_kind'],
+        'sub_batch_no': fname_meta['sub_batch_no'],
+        'suffix_n': suffix_n,
+        'point_count': len(temps),
+        'temperature_c': temps if temps else None,
+        'resistance_ohm': resistances if resistances else None,
+        'file_size': file_size,
+        'file_mtime': file_mtime,
+        'sha256': sha,
+        'parse_status': parse_status,
+        'raw_header': raw_header,
+    }
 
 
 # ─────────── SQL ───────────
@@ -269,14 +296,70 @@ _INSERT_SQL = text("""
 """)
 
 
+# ─────────── 한 row 처리 ───────────
+
+def _process_one_file(s, file_path: Path, base_name: str, suffix_n: int, counters: dict) -> None:
+    """한 .dat 처리. 정상/에러 격리 분기 모두 처리.
+
+    counters: {'files_inserted', 'files_with_error', 'fully_failed'}
+    """
+    # 메타 추출 (파일 stat + sha — 거의 실패 안 함)
+    file_size = None
+    file_mtime = None
+    sha = None
+    try:
+        stat = file_path.stat()
+        file_size = stat.st_size
+        file_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        sha = _compute_sha256(file_path)
+    except Exception as e:
+        stat_error = f"{type(e).__name__}: {e}"
+        log.warning(f"cannot stat/sha {file_path}: {stat_error[:200]}")
+        # sha 없으면 격리 INSERT도 못 함 (sha NOT NULL).
+        counters['fully_failed'] += 1
+        return
+
+    # 1단계: 정상 INSERT 시도 (savepoint 1)
+    error_msg = None
+    try:
+        with s.begin_nested():
+            raw_header, temps, resistances = _parse_dat_content(file_path)
+            parse_status = 'ok' if temps else 'header_only'
+            payload = _build_payload(
+                file_path, suffix_n, sha, file_size, file_mtime,
+                raw_header, temps, resistances, parse_status,
+            )
+            s.execute(_INSERT_SQL, payload)
+        counters['files_inserted'] += 1
+        return
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        log.warning(f"failed to insert {file_path}: {error_msg[:200]}")
+
+    # 2단계: 격리 INSERT (메타만, 시계열 NULL, parse_status='error') (savepoint 2)
+    try:
+        with s.begin_nested():
+            payload = _build_payload(
+                file_path, suffix_n, sha, file_size, file_mtime,
+                error_msg[:500] if error_msg else "unknown error",
+                [], [],
+                'error',
+            )
+            s.execute(_INSERT_SQL, payload)
+        counters['files_with_error'] += 1
+    except Exception as e2:
+        log.error(f"isolation INSERT also failed for {file_path}: {type(e2).__name__}: {e2}")
+        counters['fully_failed'] += 1
+
+
 # ─────────── 메인 ───────────
 
 def parse_measurements_tree() -> dict:
     """측정 .dat 트리 traversal + 적재. sync_sputter에서 호출.
 
-    Returns:
-        {"status": "ok"|"error", "files_seen": N, "files_inserted": M,
-         "files_skipped": K, "errors": E, ...}
+    실패 row 정책 (Phase 4 Step 17 fix):
+    - savepoint로 한 row 실패가 batch 나머지에 영향 안 줌
+    - 실패 row는 메타만 INSERT (시계열 NULL, parse_status='error')
     """
     base = Path(MEASUREMENT_ROOT)
     if not base.exists():
@@ -284,8 +367,10 @@ def parse_measurements_tree() -> dict:
         return {
             "status": "error",
             "error": f"MEASUREMENT_ROOT not found: {base}",
-            "files_seen": 0, "files_inserted": 0,
-            "files_skipped": 0, "errors": 0,
+            "files_seen": 0,
+            "files_inserted": 0,
+            "files_with_error": 0,
+            "fully_failed": 0,
         }
 
     log.info(f"=== measurements_tree start: {base} ===")
@@ -298,84 +383,41 @@ def parse_measurements_tree() -> dict:
         return {
             "status": "error",
             "error": f"discover failed: {e}",
-            "files_seen": 0, "files_inserted": 0,
-            "files_skipped": 0, "errors": 0,
+            "files_seen": 0,
+            "files_inserted": 0,
+            "files_with_error": 0,
+            "fully_failed": 0,
         }
 
     files_seen = len(candidates)
     log.info(f"discovered {files_seen} candidate .dat files (max-N selected per group)")
 
-    files_inserted = 0
-    files_skipped = 0
-    errors = 0
+    counters = {
+        'files_inserted': 0,    # parse_status='ok' or 'header_only'
+        'files_with_error': 0,  # parse_status='error' (격리 INSERT 성공)
+        'fully_failed': 0,      # 격리 INSERT도 실패 (sha 못 채운 경우 등)
+    }
 
-    # batch commit
     for batch_idx in range(0, files_seen, BATCH_SIZE):
         batch = candidates[batch_idx : batch_idx + BATCH_SIZE]
 
         with session_scope_writer() as s:
             for file_path, base_name, suffix_n in batch:
-                try:
-                    # 파일 메타
-                    stat = file_path.stat()
-                    file_size = stat.st_size
-                    file_mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-
-                    # sha256
-                    sha = _compute_sha256(file_path)
-
-                    # .dat 내용 파싱
-                    raw_header, temps, resistances = _parse_dat_content(file_path)
-                    point_count = len(temps)
-                    parse_status = 'ok' if point_count > 0 else 'header_only'
-
-                    # 폴더 메타
-                    year, measurement_date, process_seq = _extract_folder_meta(file_path)
-
-                    # 파일명 메타
-                    fname_meta = _extract_filename_meta(file_path.name, suffix_n)
-
-                    # INSERT
-                    s.execute(_INSERT_SQL, {
-                        'file_path': str(file_path),
-                        'file_name': file_path.name,
-                        'file_dir': str(file_path.parent),
-                        'year': year,
-                        'measurement_date': measurement_date,
-                        'process_seq': process_seq,
-                        'process_seq_in_name': fname_meta['process_seq_in_name'],
-                        'sample_seq': fname_meta['sample_seq'],
-                        'sub_label_raw': fname_meta['sub_label_raw'],
-                        'sub_kind': fname_meta['sub_kind'],
-                        'sub_batch_no': fname_meta['sub_batch_no'],
-                        'suffix_n': suffix_n,
-                        'point_count': point_count,
-                        'temperature_c': temps if temps else None,
-                        'resistance_ohm': resistances if resistances else None,
-                        'file_size': file_size,
-                        'file_mtime': file_mtime,
-                        'sha256': sha,
-                        'parse_status': parse_status,
-                        'raw_header': raw_header,
-                    })
-                    files_inserted += 1
-
-                except Exception as e:
-                    log.warning(f"failed to process {file_path}: {type(e).__name__}: {e}")
-                    errors += 1
-                    continue
+                _process_one_file(s, file_path, base_name, suffix_n, counters)
 
         log.info(f"batch {batch_idx + len(batch)}/{files_seen} processed")
 
     log.info(
         f"=== measurements_tree done: "
-        f"+{files_inserted} inserted, {files_skipped} skipped, {errors} errors "
+        f"+{counters['files_inserted']} ok, "
+        f"+{counters['files_with_error']} error-isolated, "
+        f"{counters['fully_failed']} fully-failed "
         f"(of {files_seen} candidates) ==="
     )
     return {
         "status": "ok",
         "files_seen": files_seen,
-        "files_inserted": files_inserted,
-        "files_skipped": files_skipped,
-        "errors": errors,
+        "files_inserted": counters['files_inserted'],
+        "files_with_error": counters['files_with_error'],
+        "fully_failed": counters['fully_failed'],
     }
