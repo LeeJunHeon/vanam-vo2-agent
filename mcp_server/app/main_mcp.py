@@ -1,24 +1,27 @@
 """vo2-mcp-server MCP 프로토콜 어댑터.
 
-기존 FastAPI REST(/health, /tools/*)와 별개로 ChatGPT custom connector 등
-외부 MCP 클라이언트가 사용할 Streamable HTTP MCP 엔드포인트를 노출한다.
-같은 tools/search_vo2_runs.run()을 재사용한다.
+Phase 4 Step 20: agentic SQL 3개 도구를 MCP tool로 등록.
+FastMCP가 streamable HTTP transport ASGI app을 만들고, main.py가 /mcp/ 에 mount.
+
+ChatGPT Custom Connector, Claude Desktop 등 외부 MCP 클라이언트가 이 endpoint 사용.
 
 stateless_http=True: Mcp-Session-Id 추적 없음. curl 검증 단순화 + ChatGPT 호환.
 """
+
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
 
-from mcp_server.app.schemas import SearchVO2RunsRequest
-from mcp_server.app.tools import search_vo2_runs as _search_tool
+from mcp_server.app.tools import describe_schema as _describe_tool
+from mcp_server.app.tools import get_timeseries as _ts_tool
+from mcp_server.app.tools import run_sql as _sql_tool
 from shared.logging_config import setup_logging
 
 log = setup_logging("mcp_server.main_mcp")
+
 
 mcp = FastMCP(
     "vo2-mcp-server",
@@ -46,38 +49,86 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def search_vo2_runs(
-    chamber: str | None = None,
-    recipe_name: str | None = None,
-    start_after: datetime | None = None,
-    start_before: datetime | None = None,
-    sample_id: str | None = None,
-    limit: int = 50,
-) -> dict[str, Any]:
-    """VO2 sputter_runs를 chamber/recipe/시간 범위/sample_id로 검색.
+def describe_schema(table: str | None = None) -> dict[str, Any]:
+    """VO2 공정 DB의 schema/도메인 지식/예시 row를 한 번에 반환.
 
-    파라미터:
-      chamber: 'CH1' 또는 'CH2' (현재 운영 데이터는 CH1만)
-      recipe_name: sputter 레시피 이름 (정확 매칭)
-      start_after: ISO8601 (예: '2026-05-01T00:00:00Z') 이후 run만
-      start_before: ISO8601 이전 run만
-      sample_id: sputter run 식별자 (현재는 run label과 매칭됨)
-      limit: 1~200, 기본 50
+    분석을 시작할 때 처음 호출하면 DB 전체 그림을 잡을 수 있다.
 
-    응답: {runs: [{sputter_run_id, chamber, ...}], count, provenance: {...}}
+    Args:
+        table: 조회할 테이블 (vo2. prefix 없이).
+            None이면 전체 11개 테이블 요약 + 도메인 overview + sample 매핑 가이드
+            + 자주 쓰는 쿼리 예시.
+            테이블 이름 주면 (예: 'measurements') 그 테이블의 모든 컬럼/타입/예시 5 row.
+
+    사용 가능 테이블:
+        source_files, etl_runs, mcp_audit_logs, parse_errors,
+        ald_ncd_runs, ald_rayvac_runs,
+        sputter_runs_human, sputter_runs_auto_main, sputter_runs_auto_plasma,
+        measurements, rga_runs
+
+    Returns:
+        전체 모드: {schema, database, total_tables, domain_overview,
+                    sample_mapping_guide, common_queries, tables, relationships}
+        상세 모드: {table, purpose, domain_notes, row_count, unique_constraint,
+                    foreign_keys, key_columns, columns, sample_rows}
     """
-    req = SearchVO2RunsRequest(
-        chamber=chamber,
-        recipe_name=recipe_name,
-        start_after=start_after,
-        start_before=start_before,
-        sample_id=sample_id,
-        limit=limit,
-    )
-    resp = _search_tool.run(req)
-    return resp.model_dump(mode="json")
+    return _describe_tool.run(table=table)
+
+
+@mcp.tool()
+def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
+    """vo2 schema에 read-only SELECT 실행.
+
+    안전 장치 (PostgreSQL vo2_reader 권한 + 추가 검증):
+    - SELECT 또는 WITH...SELECT만 허용
+    - INSERT/UPDATE/DELETE/DROP/ALTER/COPY/CALL 차단
+    - 세미콜론 multi-statement 차단
+    - 자동 LIMIT wrap (max_rows, 기본 100, 최대 1000)
+    - 10초 statement_timeout
+    - 배열 컬럼 (temperature_c, resistance_ohm, intensity)은 길이/preview만 반환
+    - 큰 JSONB는 keys + size만 반환
+
+    배열/시계열 raw가 필요하면 get_timeseries 도구 사용.
+
+    Args:
+        sql: SELECT 또는 WITH...SELECT 문. vo2.* 테이블 대상.
+        max_rows: 1~1000, 기본 100.
+
+    Returns:
+        {columns: [...], rows: [...], row_count: N, truncated: bool,
+         duration_ms: N, sql_executed: str, note?: str, error?: str}
+    """
+    return _sql_tool.run(sql=sql, max_rows=max_rows)
+
+
+@mcp.tool()
+def get_timeseries(
+    table: Literal["measurements", "rga_runs"],
+    row_id: int,
+) -> dict[str, Any]:
+    """measurements/rga_runs 한 row의 시계열 배열 raw + 메타데이터 + 통계.
+
+    한 번에 한 row만 (토큰 폭발 방지).
+
+    table='measurements':
+        한 .dat 파일 = 한 측정 = 한 row.
+        temperature_c (°C) + resistance_ohm (Ohm) 배열 같은 인덱스끼리 짝.
+        평균 500점. VO2 전이온도 분석은 dR/dT 변곡점 (60~70°C).
+
+    table='rga_runs':
+        한 측정 시점의 Mass 1~65 partial pressure.
+        intensity[i] = Mass (i+1)의 값.
+        notable_masses에 주요 mass (H2O, N2, O2, Ar 등) 미리 highlight.
+
+    Args:
+        table: 'measurements' 또는 'rga_runs'
+        row_id: 해당 테이블의 id 컬럼 값. run_sql로 id 미리 조회 가능.
+
+    Returns:
+        {table, row_id, metadata, data: {배열들}, summary: {통계}, info, notable_masses?}
+    """
+    return _ts_tool.run(table=table, row_id=row_id)
 
 
 # Streamable HTTP transport ASGI app — main.py에서 mount.
-# 사전 작업 3에서 확인한 메서드명이 다르면 아래를 보정.
 mcp_app = mcp.streamable_http_app()
