@@ -39,12 +39,12 @@ SOURCE_FILES: list[dict] = [
     {
         "source_type": "ald_ncd_xlsx",
         "chamber": None,                          # ALD는 chamber 무관
-        "file_path": "/data_ald/측정 Data/NCD/TiO2/TIO2 레시피, 데이터 정리_베이지안_측정용 (4)의 복사본.xlsx",
+        "file_path": "/data_ald/측정 Data/NCD/TiO2/TIO2 레시피, 데이터 정리_베이지안_측정용.xlsx",
     },
     {
         "source_type": "ald_rayvac_xlsx",
         "chamber": None,
-        "file_path": "/data_ald/측정 Data/Rayvac/TiO2/tio2두께 정리_260429.xlsx",
+        "file_path": "/data_ald/측정 Data/Rayvac/TiO2/tio2두께 정리.xlsx",
     },
     # ───── Sputter (Phase 4 Step 15-16) ──────────────────────────────
     {
