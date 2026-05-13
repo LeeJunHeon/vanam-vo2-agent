@@ -27,6 +27,7 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
+from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.ald_rayvac")
 
@@ -271,10 +272,14 @@ def _build_payload(
     return payload
 
 
-def _process_sheet(ws, source_file_id: int) -> tuple[int, int]:
-    """Rayvac 단일 시트 처리. (inserted, errors) 반환."""
+def _process_sheet(ws, source_file_id: int) -> tuple[int, int, int]:
+    """Rayvac 단일 시트 처리. (inserted, errors, skipped_old) 반환."""
     inserted = 0
     errors = 0
+    skipped_old = 0
+
+    # Step 23: incremental — 단일 시트라 chemistry 필터 불필요
+    watermark = row_number_watermark("vo2.ald_rayvac_runs")
 
     # R1 헤더 (Rayvac은 R1이 컬럼명, NCD R2와 다름)
     header_rows = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))
@@ -296,6 +301,11 @@ def _process_sheet(ws, source_file_id: int) -> tuple[int, int]:
             ):
                 break
 
+            # Step 23: incremental skip
+            if row_idx <= watermark:
+                skipped_old += 1
+                continue
+
             error = _validate_row(row, row_idx)
             if error:
                 raw_data = _row_to_full_dict(row, header)
@@ -316,8 +326,11 @@ def _process_sheet(ws, source_file_id: int) -> tuple[int, int]:
             s.execute(_INSERT_RAYVAC_SQL, payload)
             inserted += 1
 
-    log.info(f"Rayvac 시트 처리: +{inserted} rows, {errors} errors")
-    return inserted, errors
+    log.info(
+        f"Rayvac 시트 처리: +{inserted} rows, {errors} errors, "
+        f"{skipped_old} skipped (already in DB), watermark={watermark}"
+    )
+    return inserted, errors, skipped_old
 
 
 def parse_ald_rayvac(record: SourceFileRecord) -> dict:
@@ -330,18 +343,19 @@ def parse_ald_rayvac(record: SourceFileRecord) -> dict:
         log.info(f"skip {record.file_name} (race_unsafe, mtime too recent)")
         return {
             "status": "skipped", "reason": "race_unsafe",
-            "inserted": 0, "errors": 0,
+            "inserted": 0, "errors": 0, "skipped_old": 0,
         }
 
     if record.metadata and record.metadata.get("all_processed"):
         log.info(f"skip {record.file_name} (sha already processed)")
         return {
             "status": "skipped", "reason": "already_processed",
-            "inserted": 0, "errors": 0,
+            "inserted": 0, "errors": 0, "skipped_old": 0,
         }
 
     inserted = 0
     errors = 0
+    skipped_old = 0
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
@@ -364,11 +378,11 @@ def parse_ald_rayvac(record: SourceFileRecord) -> dict:
                 return {
                     "status": "error",
                     "error": f"sheet '{RAYVAC_SHEET}' not found",
-                    "inserted": 0, "errors": 0,
+                    "inserted": 0, "errors": 0, "skipped_old": 0,
                 }
 
             ws = wb[RAYVAC_SHEET]
-            inserted, errors = _process_sheet(ws, record.id)
+            inserted, errors, skipped_old = _process_sheet(ws, record.id)
         finally:
             wb.close()
 
@@ -376,6 +390,7 @@ def parse_ald_rayvac(record: SourceFileRecord) -> dict:
             "all_processed": True,
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -387,12 +402,14 @@ def parse_ald_rayvac(record: SourceFileRecord) -> dict:
             })
 
         log.info(
-            f"ald_rayvac {record.file_name}: +{inserted} rows ({errors} errors)"
+            f"ald_rayvac {record.file_name}: +{inserted} rows "
+            f"({errors} errors, {skipped_old} skipped)"
         )
         return {
             "status": "ok",
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
         }
 
     except Exception as e:
@@ -414,4 +431,5 @@ def parse_ald_rayvac(record: SourceFileRecord) -> dict:
             "error": error_msg,
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
         }

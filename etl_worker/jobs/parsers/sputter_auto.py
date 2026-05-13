@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
+from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.sputter_auto")
 
@@ -199,13 +200,21 @@ _UPDATE_METADATA_SQL = text("""
 """)
 
 
-def _process_sheet(ws, col_map, insert_sql, source_file_id):
-    """단일 시트 처리. inserted 카운트 반환.
+def _process_sheet(ws, col_map, insert_sql, source_file_id, table_name):
+    """단일 시트 처리. (inserted, skipped_old) 반환.
 
     데이터 시작: R4 (R1=카테고리, R2=헤더, R3=단위)
     빈 row 판정: 첫 컬럼(날짜) 비면 데이터 끝
+
+    Args:
+        table_name: 'sputter_runs_auto_main' 또는 'sputter_runs_auto_plasma'
+                    Step 23 watermark 조회용.
     """
     inserted = 0
+    skipped_old = 0
+
+    # Step 23: incremental
+    watermark = row_number_watermark(f"vo2.{table_name}")
 
     # R2 헤더 (raw_json 키용)
     header_rows = list(ws.iter_rows(min_row=2, max_row=2, values_only=True))
@@ -225,11 +234,20 @@ def _process_sheet(ws, col_map, insert_sql, source_file_id):
             ):
                 break
 
+            # Step 23: incremental skip
+            if row_idx <= watermark:
+                skipped_old += 1
+                continue
+
             payload = _build_payload(row, col_map, source_file_id, row_idx, header)
             s.execute(insert_sql, payload)
             inserted += 1
 
-    return inserted
+    log.info(
+        f"sputter_auto _process_sheet({table_name}): "
+        f"+{inserted} rows, {skipped_old} skipped, watermark={watermark}"
+    )
+    return inserted, skipped_old
 
 
 def parse_sputter_auto(record: SourceFileRecord) -> dict:
@@ -243,6 +261,7 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "skipped", "reason": "race_unsafe",
             "main_inserted": 0, "plasma_inserted": 0,
+            "main_skipped": 0, "plasma_skipped": 0,
         }
 
     if record.metadata and record.metadata.get("all_processed"):
@@ -250,29 +269,38 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "skipped", "reason": "already_processed",
             "main_inserted": 0, "plasma_inserted": 0,
+            "main_skipped": 0, "plasma_skipped": 0,
         }
 
     main_inserted = 0
     plasma_inserted = 0
+    main_skipped = 0    # Step 23
+    plasma_skipped = 0  # Step 23
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
         try:
             if "Main Process" in wb.sheetnames:
-                main_inserted = _process_sheet(
+                main_inserted, main_skipped = _process_sheet(
                     wb["Main Process"], MAIN_COL_MAP,
-                    _INSERT_MAIN_SQL, record.id
+                    _INSERT_MAIN_SQL, record.id, "sputter_runs_auto_main"
                 )
-                log.info(f"sputter_auto Main Process: +{main_inserted} rows")
+                log.info(
+                    f"sputter_auto Main Process: +{main_inserted} rows, "
+                    f"{main_skipped} skipped"
+                )
             else:
                 log.warning(f"'Main Process' sheet not found in {record.file_name}")
 
             if "Plasma Cleaning" in wb.sheetnames:
-                plasma_inserted = _process_sheet(
+                plasma_inserted, plasma_skipped = _process_sheet(
                     wb["Plasma Cleaning"], PLASMA_COL_MAP,
-                    _INSERT_PLASMA_SQL, record.id
+                    _INSERT_PLASMA_SQL, record.id, "sputter_runs_auto_plasma"
                 )
-                log.info(f"sputter_auto Plasma Cleaning: +{plasma_inserted} rows")
+                log.info(
+                    f"sputter_auto Plasma Cleaning: +{plasma_inserted} rows, "
+                    f"{plasma_skipped} skipped"
+                )
             else:
                 log.warning(f"'Plasma Cleaning' sheet not found in {record.file_name}")
         finally:
@@ -282,6 +310,8 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
             "all_processed": True,
             "main_inserted": main_inserted,
             "plasma_inserted": plasma_inserted,
+            "main_skipped": main_skipped,
+            "plasma_skipped": plasma_skipped,
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -294,12 +324,15 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
 
         log.info(
             f"sputter_auto {record.file_name}: "
-            f"main +{main_inserted}, plasma +{plasma_inserted}"
+            f"main +{main_inserted} ({main_skipped} skipped), "
+            f"plasma +{plasma_inserted} ({plasma_skipped} skipped)"
         )
         return {
             "status": "ok",
             "main_inserted": main_inserted,
             "plasma_inserted": plasma_inserted,
+            "main_skipped": main_skipped,
+            "plasma_skipped": plasma_skipped,
         }
 
     except Exception as e:
@@ -316,4 +349,5 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "error", "error": error_msg,
             "main_inserted": main_inserted, "plasma_inserted": plasma_inserted,
+            "main_skipped": main_skipped, "plasma_skipped": plasma_skipped,
         }

@@ -27,6 +27,7 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
+from etl_worker.jobs.parsers._incremental import measured_at_watermark
 
 log = logging.getLogger("etl.parsers.rga_csv")
 
@@ -157,6 +158,10 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
 
     inserted = 0
     errors = 0
+    skipped_old = 0
+
+    # Step 23: incremental — 이미 적재된 마지막 시점 이후의 row 만 INSERT
+    watermark = measured_at_watermark("vo2.rga_runs")
 
     try:
         # BOM 처리: utf-8-sig로 읽기 (BOM이 있으면 자동 제거)
@@ -233,6 +238,18 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
 
                         parse_status = 'ok' if measured_at else 'time_invalid'
 
+                        # Step 23: incremental skip
+                        # - watermark 가 None 이면 첫 적재 (모두 신규)
+                        # - measured_at 가 None (time_invalid) 인 row 는 일단 INSERT (소량, 운영자 안내 필요)
+                        # - 그 외 measured_at <= watermark 면 옛 적재분
+                        if (
+                            watermark is not None
+                            and measured_at is not None
+                            and measured_at <= watermark
+                        ):
+                            skipped_old += 1
+                            continue
+
                         payload = _build_payload(
                             record.id, row_idx, time_raw, measured_at,
                             mass_count, intensity, header, row, parse_status,
@@ -258,7 +275,11 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
             "all_processed": True,
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
             "mass_count": mass_count,
+            "watermark_at_start": (
+                watermark.isoformat() if watermark else None
+            ),
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -271,12 +292,13 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
 
         log.info(
             f"rga_csv {record.file_name}: +{inserted} rows, {errors} errors, "
-            f"{mass_count} mass columns"
+            f"{skipped_old} skipped (already in DB), {mass_count} mass columns"
         )
         return {
             "status": "ok",
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
             "mass_count": mass_count,
         }
 
@@ -296,4 +318,5 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
             "error": error_msg,
             "inserted": inserted,
             "errors": errors,
+            "skipped_old": skipped_old,
         }

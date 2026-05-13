@@ -28,6 +28,7 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
+from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.ald_ncd")
 
@@ -258,10 +259,18 @@ def _build_payload(
 
 def _process_sheet(
     ws, sheet_name: str, chemistry: str, source_file_id: int
-) -> tuple[int, int]:
-    """한 시트 처리. (inserted_count, error_count) 반환."""
+) -> tuple[int, int, int]:
+    """한 시트 처리. (inserted_count, error_count, skipped_old_count) 반환."""
     inserted = 0
     errors = 0
+    skipped_old = 0
+
+    # Step 23: incremental — chemistry 별 watermark 조회 (TTIP/TDMAT 따로)
+    watermark = row_number_watermark(
+        "vo2.ald_ncd_runs",
+        extra_where="AND chemistry = :chem",
+        params={"chem": chemistry},
+    )
 
     # R2 헤더 추출 (raw_json 키로 사용)
     header_rows = list(ws.iter_rows(min_row=2, max_row=2, values_only=True))
@@ -283,6 +292,12 @@ def _process_sheet(
                 isinstance(first_cell, str) and not first_cell.strip()
             ):
                 break
+
+            # Step 23: incremental skip
+            # row_idx 가 xlsx 의 row_number. watermark 이하면 이미 적재된 row.
+            if row_idx <= watermark:
+                skipped_old += 1
+                continue
 
             # 검증
             error = _validate_row(row, chemistry, row_idx)
@@ -308,9 +323,10 @@ def _process_sheet(
             inserted += 1
 
     log.info(
-        f"NCD '{chemistry}' 시트 처리: +{inserted} rows, {errors} errors"
+        f"NCD '{chemistry}' 시트 처리: +{inserted} rows, {errors} errors, "
+        f"{skipped_old} skipped (already in DB), watermark={watermark}"
     )
-    return inserted, errors
+    return inserted, errors, skipped_old
 
 
 def parse_ald_ncd(record: SourceFileRecord) -> dict:
@@ -329,6 +345,7 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "status": "skipped", "reason": "race_unsafe",
             "ttip_inserted": 0, "tdmat_inserted": 0,
             "ttip_errors": 0, "tdmat_errors": 0,
+            "ttip_skipped": 0, "tdmat_skipped": 0,
         }
 
     # 같은 sha 이미 처리된 경우 skip (성능 절약)
@@ -340,12 +357,15 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "status": "skipped", "reason": "already_processed",
             "ttip_inserted": 0, "tdmat_inserted": 0,
             "ttip_errors": 0, "tdmat_errors": 0,
+            "ttip_skipped": 0, "tdmat_skipped": 0,
         }
 
     ttip_inserted = 0
     tdmat_inserted = 0
     ttip_errors = 0
     tdmat_errors = 0
+    ttip_skipped = 0    # Step 23
+    tdmat_skipped = 0   # Step 23
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
@@ -357,13 +377,13 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
                     )
                     continue
                 ws = wb[sheet_name]
-                inserted, errors = _process_sheet(
+                inserted, errors, skipped_old = _process_sheet(
                     ws, sheet_name, chemistry, record.id
                 )
                 if chemistry == "TTIP":
-                    ttip_inserted, ttip_errors = inserted, errors
+                    ttip_inserted, ttip_errors, ttip_skipped = inserted, errors, skipped_old
                 else:
-                    tdmat_inserted, tdmat_errors = inserted, errors
+                    tdmat_inserted, tdmat_errors, tdmat_skipped = inserted, errors, skipped_old
         finally:
             wb.close()
 
@@ -374,6 +394,8 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
+            "ttip_skipped": ttip_skipped,
+            "tdmat_skipped": tdmat_skipped,
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -386,8 +408,8 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
 
         log.info(
             f"ald_ncd {record.file_name}: "
-            f"TTIP +{ttip_inserted} ({ttip_errors} err), "
-            f"TDMAT +{tdmat_inserted} ({tdmat_errors} err)"
+            f"TTIP +{ttip_inserted} ({ttip_errors} err, {ttip_skipped} skipped), "
+            f"TDMAT +{tdmat_inserted} ({tdmat_errors} err, {tdmat_skipped} skipped)"
         )
         return {
             "status": "ok",
@@ -395,6 +417,8 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
+            "ttip_skipped": ttip_skipped,
+            "tdmat_skipped": tdmat_skipped,
         }
 
     except Exception as e:
@@ -418,4 +442,6 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
+            "ttip_skipped": ttip_skipped,
+            "tdmat_skipped": tdmat_skipped,
         }

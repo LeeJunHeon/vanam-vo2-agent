@@ -37,6 +37,7 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
+from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.sputter_human")
 
@@ -268,15 +269,19 @@ def _build_payload(
 def parse_sputter_human(record: SourceFileRecord) -> dict:
     if record.is_race_unsafe:
         log.info(f"skip {record.file_name} (race_unsafe)")
-        return {"status": "skipped", "reason": "race_unsafe", "inserted": 0}
+        return {"status": "skipped", "reason": "race_unsafe", "inserted": 0, "skipped_old": 0}
 
     if record.metadata and record.metadata.get("all_processed"):
         log.info(f"skip {record.file_name} (sha already processed)")
-        return {"status": "skipped", "reason": "already_processed", "inserted": 0}
+        return {"status": "skipped", "reason": "already_processed", "inserted": 0, "skipped_old": 0}
 
     inserted = 0
     marker_count = 0
     empty_count = 0
+    skipped_old = 0
+
+    # Step 23: incremental
+    watermark = row_number_watermark("vo2.sputter_runs_human")
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
@@ -291,7 +296,10 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                         "parser_status": "error",
                         "parser_error": f"sheet '{SHEET_NAME}' not found",
                     })
-                return {"status": "error", "error": f"sheet '{SHEET_NAME}' not found", "inserted": 0}
+                return {
+                    "status": "error", "error": f"sheet '{SHEET_NAME}' not found",
+                    "inserted": 0, "skipped_old": 0,
+                }
 
             ws = wb[SHEET_NAME]
 
@@ -313,6 +321,10 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                         empty_streak += 1
                         if empty_streak >= 5:
                             break
+                        # Step 23: incremental skip
+                        if row_idx <= watermark:
+                            skipped_old += 1
+                            continue
                         payload = _build_payload(
                             row, record.id, row_idx, header,
                             current_date, 'fully_empty', 'empty', None
@@ -345,6 +357,13 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                         row, record.id, row_idx, header,
                         current_date, raw_type, row_kind, process_seq
                     )
+
+                    # Step 23: incremental skip — 분류는 했지만 INSERT 만 skip
+                    # (current_date forward fill 은 위에서 이미 갱신됨)
+                    if row_idx <= watermark:
+                        skipped_old += 1
+                        continue
+
                     s.execute(_INSERT_HUMAN_SQL, payload)
                     inserted += 1
 
@@ -359,6 +378,8 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
             "inserted": inserted,
             "marker_rows": marker_count,
             "empty_rows": empty_count,
+            "skipped_old": skipped_old,
+            "watermark_at_start": watermark,
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -371,11 +392,13 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
 
         log.info(
             f"sputter_human {record.file_name}: +{inserted} rows "
-            f"(markers={marker_count}, empty={empty_count})"
+            f"(markers={marker_count}, empty={empty_count}, "
+            f"skipped_old={skipped_old}, watermark={watermark})"
         )
         return {
             "status": "ok",
             "inserted": inserted,
+            "skipped_old": skipped_old,
             "marker_rows": marker_count,
             "empty_rows": empty_count,
         }
@@ -394,4 +417,7 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                 "parser_status": "error",
                 "parser_error": error_msg[:1000],
             })
-        return {"status": "error", "error": error_msg, "inserted": inserted}
+        return {
+            "status": "error", "error": error_msg,
+            "inserted": inserted, "skipped_old": skipped_old,
+        }
