@@ -1,15 +1,30 @@
-"""사람 sputter log xlsx 파서 — '통합' 단일 시트 → sputter_runs_human.
+"""사람 sputter log xlsx 파서 — Phase 4 Step 22: forward fill + 분류.
 
-전략: ETL은 xlsx → DB 단순 복사. 해석은 agent.
+전략 변경 (Step 22):
+- 시트의 '날짜' 컬럼이 5가지 의미로 쓰임 → 분류 + forward fill
+- 모든 데이터 보존 + process_date 정확성 100%
 
 xlsx 구조:
 - '통합' 시트: R1=헤더, R2=단위, R3부터 데이터
 - C0~C22 (W까지) 23 컬럼 매핑. C23+ 무시.
-- 사람이 손으로 적어 혼합 타입 다수 → 모두 TEXT 보존.
+
+'날짜' 컬럼 분류 (raw_date_type):
+- yyyymmdd_pure_marker: YYYYMMDD 큰 숫자 + 우측 비어있음 (담당='Pre' 또는 빈칸) → row_kind='marker'
+- yyyymmdd_integrated: YYYYMMDD 큰 숫자 + 우측 데이터 있음 (옛 패턴) → row_kind='process'
+- datetime_excel: Excel 자동변환 datetime (예: '6-1' → 2026-06-01) → forward fill
+- small_number: 1, 2, 3, ..., 7 같은 작은 숫자 (그 날의 N번째 공정 순서) → forward fill
+- text: 'depo', 'depo1', 'RFP2', 'DCP 1' 등 텍스트 → forward fill
+- null_with_data: '날짜' 빈칸 + 다른 컬럼 데이터 있음 → forward fill
+- fully_empty: 모든 컬럼 빈 row → row_kind='empty'
+- orphan_before_first_marker: 첫 마커 만나기 전 row → process_date NULL
+
+forward fill:
+- 마커 row 만나면 current_date 갱신
+- 마커 아닌 row의 process_date = current_date
 
 빈 row 판정:
-- 23 컬럼 모두 비어있어야 진짜 빈 row.
-- 5 연속이면 데이터 끝.
+- 23 컬럼 모두 비어있어야 fully_empty.
+- 연속 5개 fully_empty면 데이터 끝 (break).
 """
 
 import json
@@ -26,31 +41,35 @@ log = logging.getLogger("etl.parsers.sputter_human")
 
 SHEET_NAME = "통합"
 
-# (col_idx, db_col, type)  type: 'timestamp' | 'real' | 'text'
+# YYYYMMDD 마커 판정 범위
+YYYYMMDD_MIN = 20240101
+YYYYMMDD_MAX = 20271231
+
+# (col_idx, db_col, type) type: 'real' | 'text'
+# process_date는 forward fill로 별도 처리하므로 여기서 제외
 HUMAN_COL_MAP = [
-    (0,  'process_date',       'timestamp'),
-    (1,  'operator',           'text'),
-    (2,  'sub_label_raw',      'text'),
-    (3,  'pc_gas',             'text'),
-    (4,  'pc_power_w',         'real'),
-    (5,  'pc_pressure_mtorr',  'real'),
-    (6,  'pc_gas_flow_sccm',   'real'),
-    (7,  'pc_time_min',        'real'),
-    (8,  'shutter_delay_min',  'real'),
-    (9,  'sp_power_w',         'real'),
-    (10, 'sp_flow_sccm',       'real'),
-    (11, 'sp_pressure_mtorr',  'real'),
-    (12, 'sp_time',            'text'),
-    (13, 'thickness',          'text'),
-    (14, 'furnace_type',       'text'),
-    (15, 'annealing_temp',     'text'),
+    (1, 'operator', 'text'),
+    (2, 'sub_label_raw', 'text'),
+    (3, 'pc_gas', 'text'),
+    (4, 'pc_power_w', 'real'),
+    (5, 'pc_pressure_mtorr', 'real'),
+    (6, 'pc_gas_flow_sccm', 'real'),
+    (7, 'pc_time_min', 'real'),
+    (8, 'shutter_delay_min', 'real'),
+    (9, 'sp_power_w', 'real'),
+    (10, 'sp_flow_sccm', 'real'),
+    (11, 'sp_pressure_mtorr', 'real'),
+    (12, 'sp_time', 'text'),
+    (13, 'thickness', 'text'),
+    (14, 'furnace_type', 'text'),
+    (15, 'annealing_temp', 'text'),
     (16, 'annealing_gas_flow', 'text'),
-    (17, 'pulsed_dc_freq',     'text'),
-    (18, 'off_time_us',        'real'),
-    (19, 'duty',               'text'),
-    (20, 'depo_rate',          'text'),
-    (21, 'target',             'text'),
-    (22, 'notes',              'text'),
+    (17, 'pulsed_dc_freq', 'text'),
+    (18, 'off_time_us', 'real'),
+    (19, 'duty', 'text'),
+    (20, 'depo_rate', 'text'),
+    (21, 'target', 'text'),
+    (22, 'notes', 'text'),
 ]
 
 
@@ -79,14 +98,6 @@ def _to_text(v):
     return str(v)
 
 
-def _to_timestamp(v):
-    if isinstance(v, datetime):
-        return v
-    if isinstance(v, date):
-        return datetime.combine(v, datetime.min.time())
-    return None
-
-
 def _serialize(v):
     if isinstance(v, (datetime, date)):
         return v.isoformat()
@@ -103,7 +114,7 @@ def _row_to_full_dict(row, header):
     return result
 
 
-def _is_truly_empty_row(row, max_col=23):
+def _is_fully_empty(row, max_col=23):
     for i in range(max_col):
         if i < len(row):
             v = row[i]
@@ -112,7 +123,69 @@ def _is_truly_empty_row(row, max_col=23):
     return True
 
 
-_DB_COLS = [m[1] for m in HUMAN_COL_MAP]
+def _count_right_data(row, start_col=1, end_col=23):
+    count = 0
+    for i in range(start_col, end_col):
+        if i < len(row):
+            v = row[i]
+            if v is not None and not (isinstance(v, str) and not v.strip()):
+                count += 1
+    return count
+
+
+def _classify_date_cell(date_val, operator, right_count):
+    """returns (raw_date_type, marker_yyyymmdd_or_None, row_kind, process_seq_or_None)."""
+    if isinstance(date_val, (int, float)):
+        v = int(date_val)
+        if YYYYMMDD_MIN <= v <= YYYYMMDD_MAX:
+            is_pure_marker = (
+                operator == "Pre"
+                or (operator is None and right_count <= 1)
+                or right_count <= 2
+            )
+            if is_pure_marker:
+                return ('yyyymmdd_pure_marker', v, 'marker', None)
+            else:
+                return ('yyyymmdd_integrated', v, 'process', None)
+        else:
+            return ('small_number', None, 'process', v)
+
+    if isinstance(date_val, datetime):
+        return ('datetime_excel', None, 'process', None)
+    if isinstance(date_val, date):
+        return ('datetime_excel', None, 'process', None)
+
+    if isinstance(date_val, str):
+        s = date_val.strip()
+        if s:
+            return ('text', None, 'process', None)
+        date_val = None
+
+    if date_val is None:
+        if right_count == 0:
+            return ('fully_empty', None, 'empty', None)
+        else:
+            return ('null_with_data', None, 'process', None)
+
+    return ('text', None, 'process', None)
+
+
+def _yyyymmdd_to_date(v):
+    s = str(int(v))
+    if len(s) != 8:
+        return None
+    try:
+        y = int(s[0:4])
+        m = int(s[4:6])
+        d = int(s[6:8])
+        return date(y, m, d)
+    except (ValueError, TypeError):
+        return None
+
+
+_DB_COLS = ['process_date'] + [m[1] for m in HUMAN_COL_MAP] + [
+    'raw_date_value', 'raw_date_type', 'process_seq_in_day', 'row_kind'
+]
 _INSERT_HUMAN_SQL = text(f"""
     INSERT INTO vo2.sputter_runs_human (
         {', '.join(_DB_COLS)},
@@ -135,16 +208,35 @@ _UPDATE_METADATA_SQL = text("""
 """)
 
 
-def _build_payload(row, source_file_id, row_number, header):
+def _build_payload(
+    row, source_file_id, row_number, header,
+    current_date, raw_date_type, row_kind, process_seq
+):
     payload = {}
+
+    if current_date is not None:
+        payload['process_date'] = datetime.combine(current_date, datetime.min.time())
+    else:
+        payload['process_date'] = None
+
     for col_idx, db_col, dtype in HUMAN_COL_MAP:
         v = row[col_idx] if col_idx < len(row) else None
         if dtype == 'real':
             payload[db_col] = _to_real(v)
-        elif dtype == 'timestamp':
-            payload[db_col] = _to_timestamp(v)
         else:
             payload[db_col] = _to_text(v)
+
+    raw_date_val = row[0] if len(row) > 0 else None
+    if raw_date_val is None:
+        payload['raw_date_value'] = None
+    elif isinstance(raw_date_val, (datetime, date)):
+        payload['raw_date_value'] = raw_date_val.isoformat()
+    else:
+        payload['raw_date_value'] = str(raw_date_val)
+
+    payload['raw_date_type'] = raw_date_type
+    payload['process_seq_in_day'] = process_seq
+    payload['row_kind'] = row_kind
 
     payload['source_file_id'] = source_file_id
     payload['row_number'] = row_number
@@ -168,15 +260,14 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
         return {"status": "skipped", "reason": "already_processed", "inserted": 0}
 
     inserted = 0
+    marker_count = 0
+    empty_count = 0
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
         try:
             if SHEET_NAME not in wb.sheetnames:
-                log.error(
-                    f"sheet '{SHEET_NAME}' not found in {record.file_name}. "
-                    f"available: {wb.sheetnames}"
-                )
+                log.error(f"sheet '{SHEET_NAME}' not found in {record.file_name}")
                 with session_scope_writer() as s:
                     s.execute(_UPDATE_METADATA_SQL, {
                         "id": record.id,
@@ -196,25 +287,64 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                 for h in header
             ]
 
+            current_date = None
             empty_streak = 0
+
             with session_scope_writer() as s:
                 for row_idx, row in enumerate(
                     ws.iter_rows(min_row=3, values_only=True), start=3
                 ):
-                    if _is_truly_empty_row(row, max_col=23):
+                    if _is_fully_empty(row, max_col=23):
                         empty_streak += 1
                         if empty_streak >= 5:
                             break
+                        payload = _build_payload(
+                            row, record.id, row_idx, header,
+                            current_date, 'fully_empty', 'empty', None
+                        )
+                        s.execute(_INSERT_HUMAN_SQL, payload)
+                        empty_count += 1
+                        inserted += 1
                         continue
                     empty_streak = 0
 
-                    payload = _build_payload(row, record.id, row_idx, header)
+                    date_val = row[0] if len(row) > 0 else None
+                    operator = row[1] if len(row) > 1 else None
+                    if isinstance(operator, str):
+                        operator = operator.strip()
+                    right_count = _count_right_data(row, start_col=1, end_col=23)
+
+                    raw_type, marker_yyyymmdd, row_kind, process_seq = _classify_date_cell(
+                        date_val, operator, right_count
+                    )
+
+                    if marker_yyyymmdd is not None:
+                        new_date = _yyyymmdd_to_date(marker_yyyymmdd)
+                        if new_date is not None:
+                            current_date = new_date
+
+                    if row_kind == 'process' and current_date is None:
+                        raw_type = 'orphan_before_first_marker'
+
+                    payload = _build_payload(
+                        row, record.id, row_idx, header,
+                        current_date, raw_type, row_kind, process_seq
+                    )
                     s.execute(_INSERT_HUMAN_SQL, payload)
                     inserted += 1
+
+                    if row_kind == 'marker':
+                        marker_count += 1
+
         finally:
             wb.close()
 
-        new_metadata = {"all_processed": True, "inserted": inserted}
+        new_metadata = {
+            "all_processed": True,
+            "inserted": inserted,
+            "marker_rows": marker_count,
+            "empty_rows": empty_count,
+        }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
                 "id": record.id,
@@ -224,12 +354,23 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                 "parser_error": None,
             })
 
-        log.info(f"sputter_human {record.file_name}: +{inserted} rows")
-        return {"status": "ok", "inserted": inserted}
+        log.info(
+            f"sputter_human {record.file_name}: +{inserted} rows "
+            f"(markers={marker_count}, empty={empty_count})"
+        )
+        return {
+            "status": "ok",
+            "inserted": inserted,
+            "marker_rows": marker_count,
+            "empty_rows": empty_count,
+        }
 
     except Exception as e:
         error_msg = str(e)
-        log.error(f"sputter_human {record.file_name} parse failed: {error_msg}", exc_info=True)
+        log.error(
+            f"sputter_human {record.file_name} parse failed: {error_msg}",
+            exc_info=True,
+        )
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
                 "id": record.id,
