@@ -11,7 +11,8 @@ xlsx 구조:
 '날짜' 컬럼 분류 (raw_date_type):
 - yyyymmdd_pure_marker: YYYYMMDD 큰 숫자 + 우측 비어있음 (담당='Pre' 또는 빈칸) → row_kind='marker'
 - yyyymmdd_integrated: YYYYMMDD 큰 숫자 + 우측 데이터 있음 (옛 패턴) → row_kind='process'
-- datetime_excel: Excel 자동변환 datetime (예: '6-1' → 2026-06-01) → forward fill
+- datetime_as_marker: 2025-06-09 이전 datetime → 진짜 마커 (시기 1, 옛 옛 운영 패턴)
+- datetime_excel: 2025-06-09 이후 datetime → Excel 자동변환 의심, forward fill
 - small_number: 1, 2, 3, ..., 7 같은 작은 숫자 (그 날의 N번째 공정 순서) → forward fill
 - text: 'depo', 'depo1', 'RFP2', 'DCP 1' 등 텍스트 → forward fill
 - null_with_data: '날짜' 빈칸 + 다른 컬럼 데이터 있음 → forward fill
@@ -44,6 +45,11 @@ SHEET_NAME = "통합"
 # YYYYMMDD 마커 판정 범위
 YYYYMMDD_MIN = 20240101
 YYYYMMDD_MAX = 20271231
+
+# Phase 4 Step 22-C: 시기 1 datetime을 마커로 인식하는 기준일
+# - 이 날짜 이전 datetime row → 진짜 진행 날짜 마커 (옛 옛 운영 패턴)
+# - 이 날짜 이후 datetime row → Excel 자동변환 의심 (운영자가 '6-1' 입력 시 Excel이 자동변환), forward fill만
+DATETIME_AS_MARKER_BEFORE = date(2025, 6, 9)
 
 # (col_idx, db_col, type) type: 'real' | 'text'
 # process_date는 forward fill로 별도 처리하므로 여기서 제외
@@ -151,8 +157,17 @@ def _classify_date_cell(date_val, operator, right_count):
             return ('small_number', None, 'process', v)
 
     if isinstance(date_val, datetime):
+        d = date_val.date()
+        if d < DATETIME_AS_MARKER_BEFORE:
+            # 시기 1 — 진짜 진행 날짜 마커로 처리
+            v = d.year * 10000 + d.month * 100 + d.day
+            return ('datetime_as_marker', v, 'process', None)
+        # 시기 2/3 — Excel 자동변환 의심 (forward fill만)
         return ('datetime_excel', None, 'process', None)
     if isinstance(date_val, date):
+        if date_val < DATETIME_AS_MARKER_BEFORE:
+            v = date_val.year * 10000 + date_val.month * 100 + date_val.day
+            return ('datetime_as_marker', v, 'process', None)
         return ('datetime_excel', None, 'process', None)
 
     if isinstance(date_val, str):
