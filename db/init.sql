@@ -247,6 +247,11 @@ CREATE TABLE IF NOT EXISTS vo2.sputter_runs_human (
     depo_rate            TEXT,
     target               TEXT,
     notes                TEXT,
+    -- Phase 4 Step 22: '날짜' 컬럼 다목적 처리 (forward fill + 분류)
+    raw_date_value       TEXT,
+    raw_date_type        TEXT,
+    process_seq_in_day   INTEGER,
+    row_kind             TEXT,
     source_file_id       BIGINT REFERENCES vo2.source_files(id) ON DELETE SET NULL,
     row_number           INTEGER NOT NULL,
     raw_json             JSONB NOT NULL,
@@ -256,6 +261,8 @@ CREATE TABLE IF NOT EXISTS vo2.sputter_runs_human (
 );
 CREATE INDEX IF NOT EXISTS idx_sputter_runs_human_date
     ON vo2.sputter_runs_human (process_date DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_sputter_runs_human_row_kind
+    ON vo2.sputter_runs_human (row_kind);
 
 -- ────────────────────────────────────────────────────────────────────────
 -- 8. sputter_runs_auto_main (자동 CH1.xlsx 'Main Process' 시트, 38 컬럼)
