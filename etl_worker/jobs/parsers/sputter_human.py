@@ -1,6 +1,13 @@
 """사람 sputter log xlsx 파서 — Phase 4 Step 22: forward fill + 분류.
 
-전략 변경 (Step 22):
+Phase 4 Step 27 — DELETE + INSERT 동기화 정책:
+- 같은 sha (metadata에 'all_processed') → skip
+- 새 sha → 같은 source_type+file_path 의 옛 row 모두 DELETE 후 모든 row INSERT
+  → xlsx 의 현재 상태 = DB 의 현재 상태 (운영자 수기 수정/삭제 모두 반영)
+- 한 트랜잭션 안에서 DELETE + 모든 INSERT (원자성, 부분 실패 시 자동 rollback)
+- forward fill 의 current_date 로직 그대로 유지 (모든 row 순서대로 처리)
+
+Phase 4 Step 22 — forward fill + 분류:
 - 시트의 '날짜' 컬럼이 5가지 의미로 쓰임 → 분류 + forward fill
 - 모든 데이터 보존 + process_date 정확성 100%
 
@@ -37,7 +44,6 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
-from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.sputter_human")
 
@@ -269,19 +275,15 @@ def _build_payload(
 def parse_sputter_human(record: SourceFileRecord) -> dict:
     if record.is_race_unsafe:
         log.info(f"skip {record.file_name} (race_unsafe)")
-        return {"status": "skipped", "reason": "race_unsafe", "inserted": 0, "skipped_old": 0}
+        return {"status": "skipped", "reason": "race_unsafe", "inserted": 0}
 
     if record.metadata and record.metadata.get("all_processed"):
         log.info(f"skip {record.file_name} (sha already processed)")
-        return {"status": "skipped", "reason": "already_processed", "inserted": 0, "skipped_old": 0}
+        return {"status": "skipped", "reason": "already_processed", "inserted": 0}
 
     inserted = 0
     marker_count = 0
     empty_count = 0
-    skipped_old = 0
-
-    # Step 23: incremental
-    watermark = row_number_watermark("vo2.sputter_runs_human")
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
@@ -298,7 +300,7 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                     })
                 return {
                     "status": "error", "error": f"sheet '{SHEET_NAME}' not found",
-                    "inserted": 0, "skipped_old": 0,
+                    "inserted": 0,
                 }
 
             ws = wb[SHEET_NAME]
@@ -314,6 +316,17 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
             empty_streak = 0
 
             with session_scope_writer() as s:
+                # Phase 4 Step 27 — DELETE + INSERT 동기화
+                # 같은 source_type + file_path 의 옛 row 모두 DELETE
+                delete_result = s.execute(text("""
+                    DELETE FROM vo2.sputter_runs_human
+                    WHERE source_file_id IN (
+                        SELECT id FROM vo2.source_files
+                        WHERE source_type = 'sputter_human_xlsx' AND file_path = :fp
+                    )
+                """), {"fp": str(record.file_path)})
+                log.info(f"sputter_human DELETE 옛 row: {delete_result.rowcount}")
+
                 for row_idx, row in enumerate(
                     ws.iter_rows(min_row=3, values_only=True), start=3
                 ):
@@ -321,10 +334,6 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                         empty_streak += 1
                         if empty_streak >= 5:
                             break
-                        # Step 23: incremental skip
-                        if row_idx <= watermark:
-                            skipped_old += 1
-                            continue
                         payload = _build_payload(
                             row, record.id, row_idx, header,
                             current_date, 'fully_empty', 'empty', None
@@ -358,12 +367,6 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
                         current_date, raw_type, row_kind, process_seq
                     )
 
-                    # Step 23: incremental skip — 분류는 했지만 INSERT 만 skip
-                    # (current_date forward fill 은 위에서 이미 갱신됨)
-                    if row_idx <= watermark:
-                        skipped_old += 1
-                        continue
-
                     s.execute(_INSERT_HUMAN_SQL, payload)
                     inserted += 1
 
@@ -378,8 +381,7 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
             "inserted": inserted,
             "marker_rows": marker_count,
             "empty_rows": empty_count,
-            "skipped_old": skipped_old,
-            "watermark_at_start": watermark,
+            "policy": "delete_insert_sync",  # Phase 4 Step 27
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -392,13 +394,12 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
 
         log.info(
             f"sputter_human {record.file_name}: +{inserted} rows "
-            f"(markers={marker_count}, empty={empty_count}, "
-            f"skipped_old={skipped_old}, watermark={watermark})"
+            f"(markers={marker_count}, empty={empty_count}) "
+            f"(DELETE+INSERT sync)"
         )
         return {
             "status": "ok",
             "inserted": inserted,
-            "skipped_old": skipped_old,
             "marker_rows": marker_count,
             "empty_rows": empty_count,
         }
@@ -419,5 +420,5 @@ def parse_sputter_human(record: SourceFileRecord) -> dict:
             })
         return {
             "status": "error", "error": error_msg,
-            "inserted": inserted, "skipped_old": skipped_old,
+            "inserted": inserted,
         }
