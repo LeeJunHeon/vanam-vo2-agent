@@ -32,6 +32,7 @@ from etl_worker.jobs.parsers.ald_rayvac import parse_ald_rayvac
 from etl_worker.jobs.parsers.sputter_human import parse_sputter_human
 from etl_worker.jobs.parsers.sputter_auto import parse_sputter_auto
 from etl_worker.jobs.parsers.measurement_dat import parse_measurements_tree
+from etl_worker.jobs.parsers.dataset_dat import parse_datasets_tree
 from etl_worker.jobs.parsers.rga_csv import parse_rga_csv
 from etl_worker.jobs.parsers.oes_csv import parse_oes_csv
 
@@ -154,6 +155,15 @@ def sync_all() -> dict:
             )
             files_processed += meas_total
             rows_inserted += meas_total
+
+        # Phase 4 Step 26 — dataset.dat 트리 (계산 결과 summary)
+        # measurement_dat 와 같은 ROOT 별도 traversal — file_path UNIQUE 멱등성
+        dataset_result = parse_datasets_tree()
+        parser_results.append({"file": "datasets_tree", **dataset_result})
+        if dataset_result["status"] == "ok":
+            files_processed += dataset_result.get("files_inserted", 0)
+            rows_inserted += dataset_result.get("samples_inserted", 0)
+            rows_inserted += dataset_result.get("samples_with_error", 0)
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
