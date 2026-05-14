@@ -202,20 +202,18 @@ def parse_oes_csv(record: SourceFileRecord) -> dict:
         _update_source_metadata(record.id, {}, 0, "error", msg)
         return {"status": "error", "reason": "filename_pattern_mismatch", "inserted": 0}
 
-    # Step 2: sputter_auto 매칭
+    # Step 2: sputter_auto 매칭 (실패해도 PCA 계속 — ETL은 단순 적재, 매칭은 agent 영역)
     sputter_id, delta_sec = _find_sputter_auto_match(started_at)
     if sputter_id is None:
-        # skip — 다음 tick 재시도. source_files metadata 는 갱신하지 않음 (sha 같으면 또 시도되도록)
         log.info(
             f"OES {record.file_name}: sputter_auto match 없음 "
-            f"(start={started_at}). 다음 tick 재시도."
+            f"(start={started_at}). FK NULL 로 적재 진행 (옛 시기 OES)."
         )
-        return {"status": "skipped", "reason": "no_sputter_match", "inserted": 0}
-
-    log.info(
-        f"OES {record.file_name}: matched sputter_auto id={sputter_id} "
-        f"(delta=+{delta_sec/60:.1f}min)"
-    )
+    else:
+        log.info(
+            f"OES {record.file_name}: matched sputter_auto id={sputter_id} "
+            f"(delta=+{delta_sec/60:.1f}min)"
+        )
 
     # Step 3: csv 읽기
     try:
@@ -386,7 +384,7 @@ def parse_oes_csv(record: SourceFileRecord) -> dict:
         "duration_sec": duration_sec,
         "sputter_auto_main_id": sputter_id,
         "match_delta_sec": delta_sec,
-        "match_method": MATCH_METHOD,
+        "match_method": MATCH_METHOD if sputter_id is not None else "no_match",
         "n_timesteps_total": n_timesteps_total,
         "n_timesteps_on": n_timesteps_on,
         "n_wavelengths_total": n_wl_total,
