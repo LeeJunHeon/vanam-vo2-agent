@@ -145,11 +145,11 @@ def _find_sputter_auto_match(started_at: datetime) -> tuple[Optional[int], Optio
         (sputter_auto_main_id, delta_seconds) or (None, None)
     """
     sql = text("""
-        SELECT id, EXTRACT(EPOCH FROM (:started_at::timestamp - process_datetime)) AS delta_sec
+        SELECT id, EXTRACT(EPOCH FROM (:started_at - process_datetime)) AS delta_sec
         FROM vo2.sputter_runs_auto_main
-        WHERE process_datetime < :started_at::timestamp
-          AND process_datetime >= :started_at::timestamp - (:window_seconds * INTERVAL '1 second')
-        ORDER BY ABS(EXTRACT(EPOCH FROM (:started_at::timestamp - process_datetime)))
+        WHERE process_datetime < :started_at
+          AND process_datetime >= :started_at - (:window_seconds * INTERVAL '1 second')
+        ORDER BY ABS(EXTRACT(EPOCH FROM (:started_at - process_datetime)))
         LIMIT 1
     """)
     with session_scope_writer() as s:
