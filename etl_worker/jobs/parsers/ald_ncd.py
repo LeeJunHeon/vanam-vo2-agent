@@ -5,15 +5,17 @@ NCD xlsx 구조:
 - '레시피 및 결과(TDMAT)' 시트: 같은 구조
 - 첫 컬럼('공정 번호')이 비면 → 데이터 끝
 - 같은 batch_no가 여러 row일 수 있음 (재공정 케이스, xlsx 그대로 보존)
+- TTIP + TDMAT 모두 같은 테이블 (ald_ncd_runs) 에 chemistry 컬럼으로 분리
 
-처리 정책:
-- 새 sha (metadata 비어있음) → 두 시트 모두 처리
+Phase 4 Step 27 — DELETE + INSERT 동기화 정책:
 - 같은 sha (metadata에 'all_processed') → skip
-- xlsx 변경 시 새 source_file_id로 새 row INSERT, 옛 데이터 그대로 보존
+- 새 sha → 같은 source_type+file_path 의 옛 row 모두 DELETE (TTIP+TDMAT 통째) 후 모든 row INSERT
+  → xlsx 의 현재 상태 = DB 의 현재 상태 (운영자 수정/삭제 모두 반영)
+- 한 트랜잭션 안에서 DELETE + 두 시트 INSERT (원자성, 부분 실패 시 자동 rollback)
 - 검증 실패 row → parse_errors 격리 (GPT 친화 자연어 메시지)
 
 멱등성:
-- ald_ncd_runs UNIQUE (source_file_id, chemistry, row_number) → ON CONFLICT DO NOTHING
+- ON CONFLICT (source_file_id, chemistry, row_number) DO NOTHING (안전망)
 - parse_errors UNIQUE (source_file_id, row_number, error_type) → ON CONFLICT DO NOTHING
 """
 
@@ -28,7 +30,6 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
-from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.ald_ncd")
 
@@ -258,19 +259,16 @@ def _build_payload(
 
 
 def _process_sheet(
-    ws, sheet_name: str, chemistry: str, source_file_id: int
-) -> tuple[int, int, int]:
-    """한 시트 처리. (inserted_count, error_count, skipped_old_count) 반환."""
+    s, ws, sheet_name: str, chemistry: str, source_file_id: int
+) -> tuple[int, int]:
+    """한 시트 처리. (inserted_count, error_count) 반환.
+
+    Phase 4 Step 27: DELETE + INSERT 동기화.
+    session 은 호출 측에서 받아온다 (한 트랜잭션 안에서 DELETE + INSERT 원자성).
+    DELETE 는 parse_ald_ncd() 진입 직후 한 번만 호출 (TTIP+TDMAT 통째).
+    """
     inserted = 0
     errors = 0
-    skipped_old = 0
-
-    # Step 23: incremental — chemistry 별 watermark 조회 (TTIP/TDMAT 따로)
-    watermark = row_number_watermark(
-        "vo2.ald_ncd_runs",
-        extra_where="AND chemistry = :chem",
-        params={"chem": chemistry},
-    )
 
     # R2 헤더 추출 (raw_json 키로 사용)
     header_rows = list(ws.iter_rows(min_row=2, max_row=2, values_only=True))
@@ -281,52 +279,45 @@ def _process_sheet(
         for h in header
     ]
 
-    with session_scope_writer() as s:
-        for row_idx, row in enumerate(
-            ws.iter_rows(min_row=3, values_only=True), start=3
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=3, values_only=True), start=3
+    ):
+        first_cell = row[0] if row else None
+
+        # 빈 row 만나면 break (xlsx 데이터 끝)
+        if first_cell is None or (
+            isinstance(first_cell, str) and not first_cell.strip()
         ):
-            first_cell = row[0] if row else None
+            break
 
-            # 빈 row 만나면 break (xlsx 데이터 끝)
-            if first_cell is None or (
-                isinstance(first_cell, str) and not first_cell.strip()
-            ):
-                break
+        # 검증
+        error = _validate_row(row, chemistry, row_idx)
+        if error:
+            # parse_errors 격리
+            raw_data = _row_to_full_dict(row, header)
+            s.execute(_INSERT_PARSE_ERROR_SQL, {
+                "source_file_id": source_file_id,
+                "row_number": row_idx,
+                "error_type": error["error_type"],
+                "error_detail": error["error_detail"],
+                "raw_data": json.dumps(
+                    {k: _serialize(v) for k, v in raw_data.items()},
+                    ensure_ascii=False,
+                ),
+            })
+            errors += 1
+            continue
 
-            # Step 23: incremental skip
-            # row_idx 가 xlsx 의 row_number. watermark 이하면 이미 적재된 row.
-            if row_idx <= watermark:
-                skipped_old += 1
-                continue
-
-            # 검증
-            error = _validate_row(row, chemistry, row_idx)
-            if error:
-                # parse_errors 격리
-                raw_data = _row_to_full_dict(row, header)
-                s.execute(_INSERT_PARSE_ERROR_SQL, {
-                    "source_file_id": source_file_id,
-                    "row_number": row_idx,
-                    "error_type": error["error_type"],
-                    "error_detail": error["error_detail"],
-                    "raw_data": json.dumps(
-                        {k: _serialize(v) for k, v in raw_data.items()},
-                        ensure_ascii=False,
-                    ),
-                })
-                errors += 1
-                continue
-
-            # 정상 row INSERT
-            payload = _build_payload(row, chemistry, source_file_id, row_idx, header)
-            s.execute(_INSERT_NCD_SQL, payload)
-            inserted += 1
+        # 정상 row INSERT
+        payload = _build_payload(row, chemistry, source_file_id, row_idx, header)
+        s.execute(_INSERT_NCD_SQL, payload)
+        inserted += 1
 
     log.info(
-        f"NCD '{chemistry}' 시트 처리: +{inserted} rows, {errors} errors, "
-        f"{skipped_old} skipped (already in DB), watermark={watermark}"
+        f"NCD '{chemistry}' 시트 처리: +{inserted} rows, {errors} errors "
+        f"(DELETE+INSERT sync)"
     )
-    return inserted, errors, skipped_old
+    return inserted, errors
 
 
 def parse_ald_ncd(record: SourceFileRecord) -> dict:
@@ -345,7 +336,6 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "status": "skipped", "reason": "race_unsafe",
             "ttip_inserted": 0, "tdmat_inserted": 0,
             "ttip_errors": 0, "tdmat_errors": 0,
-            "ttip_skipped": 0, "tdmat_skipped": 0,
         }
 
     # 같은 sha 이미 처리된 경우 skip (성능 절약)
@@ -357,33 +347,44 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "status": "skipped", "reason": "already_processed",
             "ttip_inserted": 0, "tdmat_inserted": 0,
             "ttip_errors": 0, "tdmat_errors": 0,
-            "ttip_skipped": 0, "tdmat_skipped": 0,
         }
 
     ttip_inserted = 0
     tdmat_inserted = 0
     ttip_errors = 0
     tdmat_errors = 0
-    ttip_skipped = 0    # Step 23
-    tdmat_skipped = 0   # Step 23
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
         try:
-            for sheet_name, chemistry in NCD_SHEETS:
-                if sheet_name not in wb.sheetnames:
-                    log.warning(
-                        f"sheet '{sheet_name}' not found in {record.file_name}"
+            # Phase 4 Step 27 — DELETE + INSERT 한 트랜잭션 안에서 원자성
+            # NCD 는 TTIP + TDMAT 두 시트가 같은 테이블이라 DELETE 는 한 번만
+            with session_scope_writer() as s:
+                # 같은 source_type + file_path 의 옛 row 모두 DELETE (TTIP + TDMAT 통째)
+                delete_result = s.execute(text("""
+                    DELETE FROM vo2.ald_ncd_runs
+                    WHERE source_file_id IN (
+                        SELECT id FROM vo2.source_files
+                        WHERE source_type = 'ald_ncd_xlsx' AND file_path = :fp
                     )
-                    continue
-                ws = wb[sheet_name]
-                inserted, errors, skipped_old = _process_sheet(
-                    ws, sheet_name, chemistry, record.id
-                )
-                if chemistry == "TTIP":
-                    ttip_inserted, ttip_errors, ttip_skipped = inserted, errors, skipped_old
-                else:
-                    tdmat_inserted, tdmat_errors, tdmat_skipped = inserted, errors, skipped_old
+                """), {"fp": str(record.file_path)})
+                log.info(f"ald_ncd DELETE 옛 row: {delete_result.rowcount}")
+
+                # 같은 트랜잭션 안에서 두 시트 INSERT
+                for sheet_name, chemistry in NCD_SHEETS:
+                    if sheet_name not in wb.sheetnames:
+                        log.warning(
+                            f"sheet '{sheet_name}' not found in {record.file_name}"
+                        )
+                        continue
+                    ws = wb[sheet_name]
+                    inserted, errors = _process_sheet(
+                        s, ws, sheet_name, chemistry, record.id
+                    )
+                    if chemistry == "TTIP":
+                        ttip_inserted, ttip_errors = inserted, errors
+                    else:
+                        tdmat_inserted, tdmat_errors = inserted, errors
         finally:
             wb.close()
 
@@ -394,8 +395,7 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
-            "ttip_skipped": ttip_skipped,
-            "tdmat_skipped": tdmat_skipped,
+            "policy": "delete_insert_sync",  # Phase 4 Step 27
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -408,8 +408,8 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
 
         log.info(
             f"ald_ncd {record.file_name}: "
-            f"TTIP +{ttip_inserted} ({ttip_errors} err, {ttip_skipped} skipped), "
-            f"TDMAT +{tdmat_inserted} ({tdmat_errors} err, {tdmat_skipped} skipped)"
+            f"TTIP +{ttip_inserted} ({ttip_errors} err), "
+            f"TDMAT +{tdmat_inserted} ({tdmat_errors} err) (DELETE+INSERT sync)"
         )
         return {
             "status": "ok",
@@ -417,8 +417,6 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
-            "ttip_skipped": ttip_skipped,
-            "tdmat_skipped": tdmat_skipped,
         }
 
     except Exception as e:
@@ -442,6 +440,4 @@ def parse_ald_ncd(record: SourceFileRecord) -> dict:
             "tdmat_inserted": tdmat_inserted,
             "ttip_errors": ttip_errors,
             "tdmat_errors": tdmat_errors,
-            "ttip_skipped": ttip_skipped,
-            "tdmat_skipped": tdmat_skipped,
         }
