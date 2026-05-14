@@ -1,73 +1,50 @@
-"""Incremental ETL helper — 처음 본 row 만 적재.
+"""DEPRECATED — Phase 4 Step 27 (DELETE + INSERT 동기화 정책) 이후 폐기.
 
-Phase 4 Step 23: 멱등성 키 (source_file_id, row_number) 의 한계 보완.
-새 sha 가 생기면 옛 source_file_id 의 row 들과 충돌 안 나서 통째 재INSERT 됨.
-이를 막기 위해 파서 시작 시 watermark 조회 후 그 이하 row 는 skip.
-
-정책: 한 번 적재된 row 는 영원히 그대로. 운영자가 xlsx/csv 의 옛 row 를
-수정해도 무시. 새 row (watermark 초과) 만 INSERT.
-
-두 가지 watermark:
+옛 정책 (Step 23): 처음 본 row 만 적재 (수정 무시).
 - row_number_watermark(): xlsx 의 row_number 기반 (ald, sputter)
-- measured_at_watermark(): rga 의 measured_at 기반 (csv append-only, 자연 시간)
+- measured_at_watermark(): rga 의 measured_at 기반
+
+새 정책 (Step 27): DELETE + INSERT 통째 동기화.
+- 같은 source_type + file_path 의 옛 row 모두 DELETE 후 모든 row 새로 INSERT
+- xlsx/csv 의 현재 상태 = DB 의 현재 상태 (수정/삭제 모두 반영)
+- 한 트랜잭션 안에서 DELETE + INSERT (원자성, 부분 실패 시 자동 rollback)
+
+이 파일은 누군가 실수로 옛 함수를 import 하면 DeprecationWarning 으로 즉시 알리려고
+stub 만 남겨둠. 새 코드는 이 헬퍼를 임포트하지 않음.
+
+5 파서 변경 commit:
+- Step 27 (1/6) rga_csv.py
+- Step 27 (2/6) ald_rayvac.py
+- Step 27 (3/6) ald_ncd.py
+- Step 27 (4/6) sputter_auto.py
+- Step 27 (5/6) sputter_human.py
+- Step 27 (6/6) _incremental.py 폐기 (이 파일)
 """
 
-from __future__ import annotations
-
 import logging
-from datetime import datetime
-from typing import Optional
-
-from sqlalchemy import text
-
-from shared.db import session_scope_writer
 
 log = logging.getLogger("etl.parsers._incremental")
 
+log.warning(
+    "_incremental.py 는 Phase 4 Step 27 이후 폐기됨. "
+    "DELETE + INSERT 동기화 정책으로 대체됨. "
+    "이 모듈을 import 하는 코드는 새 정책에 맞게 수정 필요."
+)
 
-def row_number_watermark(
-    table_qualified: str,
-    extra_where: str = "",
-    params: Optional[dict] = None,
-) -> int:
-    """row_number 기반 watermark 조회.
 
-    Args:
-        table_qualified: 'vo2.ald_ncd_runs' 같은 schema-qualified 이름
-        extra_where: 추가 WHERE 조건 (예: "AND chemistry = :chem")
-                     맨 앞에 "AND" 가 필요. 빈 문자열이면 무시.
-        params: extra_where 의 named parameter dict
-
-    Returns:
-        max row_number (테이블이 비었거나 모두 NULL 이면 0)
-    """
-    sql = f"""
-        SELECT COALESCE(MAX(row_number), 0)
-        FROM {table_qualified}
-        WHERE row_number IS NOT NULL
-        {extra_where}
-    """
-    with session_scope_writer() as s:
-        wm = s.execute(text(sql), params or {}).scalar_one()
-    log.info(
-        f"watermark {table_qualified}"
-        f"{f' [{params}]' if params else ''}: row_number={wm}"
+def row_number_watermark(*args, **kwargs):
+    """DEPRECATED. Phase 4 Step 27 이후 사용 금지."""
+    raise DeprecationWarning(
+        "row_number_watermark 는 Phase 4 Step 27 이후 폐기됨. "
+        "DELETE + INSERT 동기화 정책으로 대체됨. "
+        "파서에서 이 함수 호출 시 새 패턴 (한 트랜잭션 안에서 DELETE + INSERT) 으로 변경."
     )
-    return int(wm)
 
 
-def measured_at_watermark(table_qualified: str) -> Optional[datetime]:
-    """measured_at 기반 watermark (rga_runs 전용).
-
-    Returns:
-        max measured_at (없거나 모두 NULL 이면 None — 이 경우 모든 row 신규)
-    """
-    sql = f"""
-        SELECT MAX(measured_at)
-        FROM {table_qualified}
-        WHERE measured_at IS NOT NULL
-    """
-    with session_scope_writer() as s:
-        wm = s.execute(text(sql)).scalar_one_or_none()
-    log.info(f"watermark {table_qualified}: measured_at={wm}")
-    return wm
+def measured_at_watermark(*args, **kwargs):
+    """DEPRECATED. Phase 4 Step 27 이후 사용 금지."""
+    raise DeprecationWarning(
+        "measured_at_watermark 는 Phase 4 Step 27 이후 폐기됨. "
+        "DELETE + INSERT 동기화 정책으로 대체됨. "
+        "파서에서 이 함수 호출 시 새 패턴 (한 트랜잭션 안에서 DELETE + INSERT) 으로 변경."
+    )
