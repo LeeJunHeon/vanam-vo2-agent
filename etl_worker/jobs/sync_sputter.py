@@ -33,6 +33,7 @@ from etl_worker.jobs.parsers.sputter_human import parse_sputter_human
 from etl_worker.jobs.parsers.sputter_auto import parse_sputter_auto
 from etl_worker.jobs.parsers.measurement_dat import parse_measurements_tree
 from etl_worker.jobs.parsers.rga_csv import parse_rga_csv
+from etl_worker.jobs.parsers.oes_csv import parse_oes_csv
 
 log = logging.getLogger("etl.sync_sputter")
 
@@ -127,6 +128,15 @@ def sync_all() -> dict:
         # RGA CSV (Phase 4 Step 18)
         for rec in rga_csv_records:
             result = parse_rga_csv(rec)
+            parser_results.append({"file": rec.file_name, **result})
+            if result["status"] == "ok":
+                files_processed += 1
+                rows_inserted += result.get("inserted", 0)
+
+        # OES CSV (Phase 4 Step 25) — sputter_auto 후 처리 (매칭 의존)
+        oes_csv_records = [r for r in records if r.source_type == "oes_csv"]
+        for rec in oes_csv_records:
+            result = parse_oes_csv(rec)
             parser_results.append({"file": rec.file_name, **result})
             if result["status"] == "ok":
                 files_processed += 1

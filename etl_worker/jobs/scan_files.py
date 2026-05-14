@@ -11,6 +11,7 @@ INSERT 거부, last_seen_at 만 갱신. 파일이 변경(append)되면 sha256이
 """
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,6 +175,67 @@ def _scan_one(spec: dict, grace_seconds: int) -> Optional[SourceFileRecord]:
     )
 
 
+# OES 파일명 정규식 — 2025-10-15 이후 표준 패턴만 매치
+# (옛 파일 *.dat / 20251001_#3.csv / ana_*.xlsx / *_복사본.csv 는 자연 skip)
+OES_FILENAME_RE = re.compile(r'^OES_Data_(\d{8})_(\d{6})\.csv$')
+
+# 마운트 경로 (docker-compose: /volume1/VanaM_Sputter → /data:ro)
+OES_DIR = "/data/OES/CH1"
+
+
+def _scan_oes_tree(grace_seconds: int) -> list[SourceFileRecord]:
+    """OES csv 트리 traversal — Phase 4 Step 25.
+
+    /data/OES/CH1/ 의 OES_Data_YYYYMMDD_HHMMSS.csv 패턴 파일만 인덱싱.
+    옛 파일 (자유 명명 .csv/.dat, ana_*.xlsx, 복사본 등) 은 regex 매칭에서 자연 제외.
+
+    각 OES csv = source_files 한 row (sha256 기반).
+    sputter run 당 새 파일 생성 패턴이라 SOURCE_FILES (단일 file_path) 방식 부적합.
+    measurement_dat 의 트리 traversal 과 유사하지만 measurement 와 달리
+    source_files 거침 (audit 추적 필요).
+
+    Returns: SourceFileRecord 리스트 (parse 단계에서 OES 파서가 받음).
+    """
+    records: list[SourceFileRecord] = []
+    base = Path(OES_DIR)
+
+    if not base.exists():
+        log.warning(f"OES_DIR not found: {base}")
+        return records
+
+    # glob 으로 모든 csv 나열 (subdir 없으니 평탄 traversal)
+    csv_paths = sorted(base.glob("*.csv"))
+
+    matched = 0
+    skipped = 0
+    for csv_path in csv_paths:
+        m = OES_FILENAME_RE.match(csv_path.name)
+        if not m:
+            skipped += 1
+            continue
+        matched += 1
+
+        # 기존 _scan_one() 의 spec dict 형식으로 변환해서 재사용
+        spec = {
+            "source_type": "oes_csv",
+            "chamber": "CH1",
+            "file_path": str(csv_path),
+        }
+        try:
+            rec = _scan_one(spec, grace_seconds)
+            if rec is not None:
+                records.append(rec)
+        except Exception as e:
+            log.warning(f"OES scan failed for {csv_path.name}: {type(e).__name__}: {e}")
+
+    log.info(
+        f"OES tree scan: {matched} matched (OES_Data_*), "
+        f"{skipped} skipped (non-standard names), "
+        f"{len(records)} indexed"
+    )
+    return records
+
+
 def scan_all() -> list[SourceFileRecord]:
     """SOURCE_FILES 의 모든 파일을 인덱싱.
 
@@ -194,4 +256,15 @@ def scan_all() -> list[SourceFileRecord]:
             f"race_unsafe={rec.is_race_unsafe} prev_rows={rec.previous_row_count}"
         )
         records.append(rec)
+
+    # Phase 4 Step 25: OES 트리 (sputter run 별 csv)
+    oes_records = _scan_oes_tree(grace)
+    for rec in oes_records:
+        log.info(
+            f"indexed {rec.source_type}/{rec.chamber}: {rec.file_name} "
+            f"sha={rec.sha256[:8]} new={rec.is_new} "
+            f"race_unsafe={rec.is_race_unsafe} prev_rows={rec.previous_row_count}"
+        )
+    records.extend(oes_records)
+
     return records
