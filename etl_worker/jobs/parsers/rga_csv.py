@@ -5,16 +5,17 @@
 - R1 헤더: Time, Mass 1, Mass 2, ..., Mass 65 (총 66 컬럼)
 - R2~ 데이터: 각 row가 한 측정 시점
 - Time 두 형식:
-  - "2024-05-17 9:53"      (옛, MM only, 1자리 시간 가능)
-  - "2026-05-08 16:03:15"  (최근, HH:MM:SS)
+  - "2024-05-17 9:53" (옛, MM only, 1자리 시간 가능)
+  - "2026-05-08 16:03:15" (최근, HH:MM:SS)
 - Mass 값: 과학 표기 (1.69E-09 등), 음수 가능
 - 누적 단일 파일 (운영자가 sputter 공정 후 row 추가)
 
-처리:
-- record.metadata에 'all_processed' 있으면 skip
-- 새 sha → 모든 row 재처리 (옛 row는 옛 source_file_id로 보존)
-- ON CONFLICT (source_file_id, row_number) DO NOTHING
-- savepoint로 한 row 실패가 batch 영향 안 줌
+Phase 4 Step 27 — DELETE + INSERT 동기화 정책:
+- record.metadata에 'all_processed' 있으면 skip (sha 같음)
+- 새 sha → 같은 source_type+file_path 의 옛 row 모두 DELETE 후 모든 row 새로 INSERT
+  → csv 의 현재 상태 = DB 의 현재 상태 (수정/삭제 모두 반영)
+- 한 트랜잭션 안에서 DELETE + INSERT (원자성, 부분 실패 시 자동 rollback)
+- savepoint(begin_nested) 로 한 row 실패가 batch 영향 안 줌
 """
 
 import csv
@@ -27,7 +28,6 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
-from etl_worker.jobs.parsers._incremental import measured_at_watermark
 
 log = logging.getLogger("etl.parsers.rga_csv")
 
@@ -158,10 +158,6 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
 
     inserted = 0
     errors = 0
-    skipped_old = 0
-
-    # Step 23: incremental — 이미 적재된 마지막 시점 이후의 row 만 INSERT
-    watermark = measured_at_watermark("vo2.rga_runs")
 
     try:
         # BOM 처리: utf-8-sig로 읽기 (BOM이 있으면 자동 제거)
@@ -216,11 +212,21 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
             total_rows = len(data_rows)
             log.info(f"RGA file: {total_rows} data rows to process")
 
-            # batch INSERT
-            for batch_idx in range(0, total_rows, BATCH_SIZE):
-                batch = data_rows[batch_idx : batch_idx + BATCH_SIZE]
+            # Phase 4 Step 27 — DELETE + INSERT 동기화 (한 트랜잭션 안에서 원자성)
+            with session_scope_writer() as s:
+                # 같은 source_type + file_path 의 옛 row 모두 DELETE
+                delete_result = s.execute(text("""
+                    DELETE FROM vo2.rga_runs
+                    WHERE source_file_id IN (
+                        SELECT id FROM vo2.source_files
+                        WHERE source_type = 'rga_csv' AND file_path = :fp
+                    )
+                """), {"fp": str(record.file_path)})
+                log.info(f"RGA DELETE 옛 row: {delete_result.rowcount}")
 
-                with session_scope_writer() as s:
+                # batch INSERT (한 트랜잭션 안에서)
+                for batch_idx in range(0, total_rows, BATCH_SIZE):
+                    batch = data_rows[batch_idx : batch_idx + BATCH_SIZE]
                     for offset, row in enumerate(batch):
                         # row_idx: CSV 줄 번호 (1=header, 2부터 데이터)
                         row_idx = batch_idx + offset + 2
@@ -237,18 +243,6 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
                             intensity.append(_parse_intensity(row[i]))
 
                         parse_status = 'ok' if measured_at else 'time_invalid'
-
-                        # Step 23: incremental skip
-                        # - watermark 가 None 이면 첫 적재 (모두 신규)
-                        # - measured_at 가 None (time_invalid) 인 row 는 일단 INSERT (소량, 운영자 안내 필요)
-                        # - 그 외 measured_at <= watermark 면 옛 적재분
-                        if (
-                            watermark is not None
-                            and measured_at is not None
-                            and measured_at <= watermark
-                        ):
-                            skipped_old += 1
-                            continue
 
                         payload = _build_payload(
                             record.id, row_idx, time_raw, measured_at,
@@ -267,19 +261,16 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
                             )
                             errors += 1
 
-                if batch_idx % 1000 == 0 and batch_idx > 0:
-                    log.info(f"RGA progress: {batch_idx + len(batch)}/{total_rows}")
+                    if batch_idx % 1000 == 0 and batch_idx > 0:
+                        log.info(f"RGA progress: {batch_idx + len(batch)}/{total_rows}")
 
         # metadata 갱신
         new_metadata = {
             "all_processed": True,
             "inserted": inserted,
             "errors": errors,
-            "skipped_old": skipped_old,
             "mass_count": mass_count,
-            "watermark_at_start": (
-                watermark.isoformat() if watermark else None
-            ),
+            "policy": "delete_insert_sync",  # Phase 4 Step 27
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -292,13 +283,12 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
 
         log.info(
             f"rga_csv {record.file_name}: +{inserted} rows, {errors} errors, "
-            f"{skipped_old} skipped (already in DB), {mass_count} mass columns"
+            f"{mass_count} mass columns (DELETE+INSERT sync)"
         )
         return {
             "status": "ok",
             "inserted": inserted,
             "errors": errors,
-            "skipped_old": skipped_old,
             "mass_count": mass_count,
         }
 
@@ -318,5 +308,4 @@ def parse_rga_csv(record: SourceFileRecord) -> dict:
             "error": error_msg,
             "inserted": inserted,
             "errors": errors,
-            "skipped_old": skipped_old,
         }
