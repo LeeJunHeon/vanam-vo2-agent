@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.streamable_http import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 from mcp_server.app.tools import describe_schema as _describe_tool
 from mcp_server.app.tools import get_timeseries as _ts_tool
@@ -48,7 +49,15 @@ mcp = FastMCP(
 )
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Describe VO2 schema",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def describe_schema(table: str | None = None) -> dict[str, Any]:
     """VO2 공정 DB의 schema/도메인 지식/예시 row를 한 번에 반환.
 
@@ -75,7 +84,15 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
     return _describe_tool.run(table=table)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Run read-only SQL on vo2 schema",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
     """vo2 schema에 read-only SELECT 실행.
 
@@ -101,7 +118,15 @@ def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
     return _sql_tool.run(sql=sql, max_rows=max_rows)
 
 
-@mcp.tool()
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Get timeseries array for one row",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
 def get_timeseries(
     table: Literal["measurements", "rga_runs"],
     row_id: int,
