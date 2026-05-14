@@ -7,6 +7,12 @@ xlsx 구조:
 - 'Plasma Cleaning' 시트: 16 컬럼 → sputter_runs_auto_plasma
 - 두 시트 공통: R1=카테고리(skip), R2=헤더, R3=단위, R4부터 데이터
 - 첫 컬럼(날짜) 비면 데이터 끝 (자동 기록이라 깨끗)
+
+Phase 4 Step 27 — DELETE + INSERT 동기화 정책:
+- 같은 sha (metadata에 'all_processed') → skip
+- 새 sha → 같은 source_type+file_path 의 옛 row 모두 DELETE (두 테이블 각각) 후 두 시트 INSERT
+  → xlsx 의 현재 상태 = DB 의 현재 상태 (자동 기록이라 수정 일은 거의 없지만 일관성)
+- 한 트랜잭션 안에서 DELETE 2번 + 두 시트 INSERT (원자성, 부분 실패 시 자동 rollback)
 """
 
 import json
@@ -18,7 +24,6 @@ from sqlalchemy import text
 
 from shared.db import session_scope_writer
 from etl_worker.jobs.scan_files import SourceFileRecord
-from etl_worker.jobs.parsers._incremental import row_number_watermark
 
 log = logging.getLogger("etl.parsers.sputter_auto")
 
@@ -200,21 +205,17 @@ _UPDATE_METADATA_SQL = text("""
 """)
 
 
-def _process_sheet(ws, col_map, insert_sql, source_file_id, table_name):
-    """단일 시트 처리. (inserted, skipped_old) 반환.
+def _process_sheet(s, ws, col_map, insert_sql, source_file_id):
+    """단일 시트 처리. inserted 반환.
+
+    Phase 4 Step 27: DELETE + INSERT 동기화.
+    session 은 호출 측에서 받아온다 (한 트랜잭션 안에서 DELETE + INSERT 원자성).
+    DELETE 는 parse_sputter_auto() 진입 직후 각 테이블별로 호출.
 
     데이터 시작: R4 (R1=카테고리, R2=헤더, R3=단위)
     빈 row 판정: 첫 컬럼(날짜) 비면 데이터 끝
-
-    Args:
-        table_name: 'sputter_runs_auto_main' 또는 'sputter_runs_auto_plasma'
-                    Step 23 watermark 조회용.
     """
     inserted = 0
-    skipped_old = 0
-
-    # Step 23: incremental
-    watermark = row_number_watermark(f"vo2.{table_name}")
 
     # R2 헤더 (raw_json 키용)
     header_rows = list(ws.iter_rows(min_row=2, max_row=2, values_only=True))
@@ -224,30 +225,23 @@ def _process_sheet(ws, col_map, insert_sql, source_file_id, table_name):
         for h in header
     ]
 
-    with session_scope_writer() as s:
-        for row_idx, row in enumerate(
-            ws.iter_rows(min_row=4, values_only=True), start=4
+    for row_idx, row in enumerate(
+        ws.iter_rows(min_row=4, values_only=True), start=4
+    ):
+        first_cell = row[0] if row else None
+        if first_cell is None or (
+            isinstance(first_cell, str) and not first_cell.strip()
         ):
-            first_cell = row[0] if row else None
-            if first_cell is None or (
-                isinstance(first_cell, str) and not first_cell.strip()
-            ):
-                break
+            break
 
-            # Step 23: incremental skip
-            if row_idx <= watermark:
-                skipped_old += 1
-                continue
-
-            payload = _build_payload(row, col_map, source_file_id, row_idx, header)
-            s.execute(insert_sql, payload)
-            inserted += 1
+        payload = _build_payload(row, col_map, source_file_id, row_idx, header)
+        s.execute(insert_sql, payload)
+        inserted += 1
 
     log.info(
-        f"sputter_auto _process_sheet({table_name}): "
-        f"+{inserted} rows, {skipped_old} skipped, watermark={watermark}"
+        f"sputter_auto _process_sheet: +{inserted} rows (DELETE+INSERT sync)"
     )
-    return inserted, skipped_old
+    return inserted
 
 
 def parse_sputter_auto(record: SourceFileRecord) -> dict:
@@ -261,7 +255,6 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "skipped", "reason": "race_unsafe",
             "main_inserted": 0, "plasma_inserted": 0,
-            "main_skipped": 0, "plasma_skipped": 0,
         }
 
     if record.metadata and record.metadata.get("all_processed"):
@@ -269,40 +262,48 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "skipped", "reason": "already_processed",
             "main_inserted": 0, "plasma_inserted": 0,
-            "main_skipped": 0, "plasma_skipped": 0,
         }
 
     main_inserted = 0
     plasma_inserted = 0
-    main_skipped = 0    # Step 23
-    plasma_skipped = 0  # Step 23
 
     try:
         wb = load_workbook(record.file_path, read_only=True, data_only=True)
         try:
-            if "Main Process" in wb.sheetnames:
-                main_inserted, main_skipped = _process_sheet(
-                    wb["Main Process"], MAIN_COL_MAP,
-                    _INSERT_MAIN_SQL, record.id, "sputter_runs_auto_main"
-                )
-                log.info(
-                    f"sputter_auto Main Process: +{main_inserted} rows, "
-                    f"{main_skipped} skipped"
-                )
-            else:
-                log.warning(f"'Main Process' sheet not found in {record.file_name}")
+            # Phase 4 Step 27 — DELETE + INSERT 한 트랜잭션 안에서 원자성
+            # sputter_auto 는 Main + Plasma 두 시트가 각각 별도 테이블이라
+            # DELETE 도 각 테이블에 한 번씩, 같은 트랜잭션 안에서.
+            with session_scope_writer() as s:
+                # 1) 같은 source_type+file_path 의 옛 row 모두 DELETE (두 테이블)
+                for table in ('sputter_runs_auto_main', 'sputter_runs_auto_plasma'):
+                    delete_result = s.execute(text(f"""
+                        DELETE FROM vo2.{table}
+                        WHERE source_file_id IN (
+                            SELECT id FROM vo2.source_files
+                            WHERE source_type = 'sputter_auto_xlsx' AND file_path = :fp
+                        )
+                    """), {"fp": str(record.file_path)})
+                    log.info(f"sputter_auto DELETE 옛 {table}: {delete_result.rowcount}")
 
-            if "Plasma Cleaning" in wb.sheetnames:
-                plasma_inserted, plasma_skipped = _process_sheet(
-                    wb["Plasma Cleaning"], PLASMA_COL_MAP,
-                    _INSERT_PLASMA_SQL, record.id, "sputter_runs_auto_plasma"
-                )
-                log.info(
-                    f"sputter_auto Plasma Cleaning: +{plasma_inserted} rows, "
-                    f"{plasma_skipped} skipped"
-                )
-            else:
-                log.warning(f"'Plasma Cleaning' sheet not found in {record.file_name}")
+                # 2) Main Process 시트 INSERT
+                if "Main Process" in wb.sheetnames:
+                    main_inserted = _process_sheet(
+                        s, wb["Main Process"], MAIN_COL_MAP,
+                        _INSERT_MAIN_SQL, record.id
+                    )
+                    log.info(f"sputter_auto Main Process: +{main_inserted} rows")
+                else:
+                    log.warning(f"'Main Process' sheet not found in {record.file_name}")
+
+                # 3) Plasma Cleaning 시트 INSERT
+                if "Plasma Cleaning" in wb.sheetnames:
+                    plasma_inserted = _process_sheet(
+                        s, wb["Plasma Cleaning"], PLASMA_COL_MAP,
+                        _INSERT_PLASMA_SQL, record.id
+                    )
+                    log.info(f"sputter_auto Plasma Cleaning: +{plasma_inserted} rows")
+                else:
+                    log.warning(f"'Plasma Cleaning' sheet not found in {record.file_name}")
         finally:
             wb.close()
 
@@ -310,8 +311,7 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
             "all_processed": True,
             "main_inserted": main_inserted,
             "plasma_inserted": plasma_inserted,
-            "main_skipped": main_skipped,
-            "plasma_skipped": plasma_skipped,
+            "policy": "delete_insert_sync",  # Phase 4 Step 27
         }
         with session_scope_writer() as s:
             s.execute(_UPDATE_METADATA_SQL, {
@@ -324,15 +324,12 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
 
         log.info(
             f"sputter_auto {record.file_name}: "
-            f"main +{main_inserted} ({main_skipped} skipped), "
-            f"plasma +{plasma_inserted} ({plasma_skipped} skipped)"
+            f"main +{main_inserted}, plasma +{plasma_inserted} (DELETE+INSERT sync)"
         )
         return {
             "status": "ok",
             "main_inserted": main_inserted,
             "plasma_inserted": plasma_inserted,
-            "main_skipped": main_skipped,
-            "plasma_skipped": plasma_skipped,
         }
 
     except Exception as e:
@@ -349,5 +346,4 @@ def parse_sputter_auto(record: SourceFileRecord) -> dict:
         return {
             "status": "error", "error": error_msg,
             "main_inserted": main_inserted, "plasma_inserted": plasma_inserted,
-            "main_skipped": main_skipped, "plasma_skipped": plasma_skipped,
         }
