@@ -58,6 +58,60 @@ _UPDATE_ETL_RUN_SQL = text("""
 """)
 
 
+_REMATCH_OES_SQL = text("""
+UPDATE vo2.oes_runs o
+SET
+    sputter_auto_main_id = matched.matched_id,
+    match_delta_sec = matched.delta_sec,
+    match_method = 'nearest_within_window_30min'
+FROM (
+    SELECT
+        o2.id AS oes_id,
+        s.id AS matched_id,
+        EXTRACT(EPOCH FROM (o2.started_at - s.process_datetime)) AS delta_sec,
+        ROW_NUMBER() OVER (
+            PARTITION BY o2.id
+            ORDER BY ABS(EXTRACT(EPOCH FROM (o2.started_at - s.process_datetime)))
+        ) AS rn
+    FROM vo2.oes_runs o2
+    JOIN vo2.sputter_runs_auto_main s
+        ON s.process_datetime < o2.started_at
+        AND s.process_datetime >= o2.started_at - INTERVAL '30 minutes'
+    WHERE o2.sputter_auto_main_id IS NULL
+) matched
+WHERE o.id = matched.oes_id
+    AND matched.rn = 1
+""")
+
+
+def _rematch_oes_to_sputter_auto() -> int:
+    """OES rows with NULL sputter_auto_main_id 를 재매칭.
+
+    Step 27 (DELETE+INSERT 동기화) 부작용 hotfix.
+
+    oes_runs.sputter_auto_main_id FK 가 ON DELETE SET NULL 이라
+    Step 27 이 sputter_runs_auto_main 을 통째 DELETE 할 때마다
+    oes_runs.sputter_auto_main_id 가 자동 NULL 처리된다.
+
+    OES 파서는 sha skip 가드 때문에 NULL 복원 안 됨 → 이 함수가 매 tick 자동 복구.
+
+    sputter_auto 처리 후, OES 처리 전에 호출.
+
+    Returns:
+        복원된 row 수
+    """
+    try:
+        with session_scope_writer() as s:
+            result = s.execute(_REMATCH_OES_SQL)
+            n = result.rowcount or 0
+        if n > 0:
+            log.info(f"OES sputter_auto FK 재매칭: {n} row 복원")
+        return n
+    except Exception as e:
+        log.warning(f"OES sputter_auto FK 재매칭 실패 (무시): {type(e).__name__}: {e}")
+        return 0
+
+
 def sync_all() -> dict:
     """5분 tick의 메인 함수. scan + parse + 통계 기록."""
     log.info("=== sync_sputter tick start ===")
@@ -133,6 +187,13 @@ def sync_all() -> dict:
             if result["status"] == "ok":
                 files_processed += 1
                 rows_inserted += result.get("inserted", 0)
+
+        # Step 27 부작용 hotfix — sputter_auto DELETE+INSERT 후 OES NULL FK 재매칭
+        # 이유: oes_runs.sputter_auto_main_id FK 가 ON DELETE SET NULL 이라
+        # sputter_auto 가 통째 DELETE 될 때마다 OES FK 가 자동 NULL 처리됨.
+        # OES 파서는 sha skip 가드라 재매칭 안 함 → 매 tick 명시적 복구 필요.
+        rematch_n = _rematch_oes_to_sputter_auto()
+        parser_results.append({"file": "oes_rematch", "status": "ok", "restored": rematch_n})
 
         # OES CSV (Phase 4 Step 25) — sputter_auto 후 처리 (매칭 의존)
         oes_csv_records = [r for r in records if r.source_type == "oes_csv"]
