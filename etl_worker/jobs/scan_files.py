@@ -121,8 +121,20 @@ _UPSERT_SQL = text("""
 """)
 
 
+_FAST_PATH_LOOKUP_SQL = text("""
+SELECT id, sha256, row_count, metadata, modified_at, file_size
+FROM vo2.source_files
+WHERE file_path = :file_path
+ORDER BY id DESC
+LIMIT 1
+""")
+
+
 def _scan_one(spec: dict, grace_seconds: int) -> Optional[SourceFileRecord]:
-    """한 source 파일을 인덱싱. 파일이 없으면 None."""
+    """한 source 파일을 인덱싱. 파일이 없으면 None.
+
+    Fast-path: DB 의 최신 row 와 mtime + size 가 같으면 sha 재계산 skip.
+    """
     p = Path(spec["file_path"])
     if not p.exists():
         log.warning(f"file not found: {p}")
@@ -131,8 +143,32 @@ def _scan_one(spec: dict, grace_seconds: int) -> Optional[SourceFileRecord]:
     stat = p.stat()
     mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
     size = stat.st_size
-    sha = _compute_sha256(p)
     race_unsafe = _is_race_unsafe(mtime, grace_seconds)
+
+    # Fast-path: DB 최신 row 와 mtime + size 같으면 sha 재계산 skip
+    # mtime 은 OS 가 자동 갱신 (xlsx save / csv append 모두 mtime 변경됨)
+    # mtime + size 둘 다 같으면 내용 동일 보장
+    sha: Optional[str] = None
+    try:
+        with session_scope_writer() as s:
+            existing = s.execute(_FAST_PATH_LOOKUP_SQL, {
+                "file_path": str(p),
+            }).fetchone()
+        if existing is not None:
+            db_mtime = existing[4]
+            db_size = existing[5]
+            # mtime 비교 (tzinfo 정규화)
+            if db_mtime is not None and db_mtime.tzinfo is None:
+                db_mtime = db_mtime.replace(tzinfo=timezone.utc)
+            if db_mtime == mtime and db_size == size:
+                sha = existing[1]  # DB 의 sha 재사용
+                log.debug(f"fast-path: {p.name} (mtime+size unchanged)")
+    except Exception as e:
+        log.warning(f"fast-path lookup failed for {p.name}, falling back to sha: {type(e).__name__}: {e}")
+        sha = None
+
+    if sha is None:
+        sha = _compute_sha256(p)  # 변경 감지된 경우만 sha 재계산
 
     # ALD 등 chamber 무관 source는 None 가능. 안전 처리.
     chamber = spec.get("chamber")
