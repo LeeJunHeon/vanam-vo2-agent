@@ -41,6 +41,13 @@ ETL 원칙:
 - 해석/매칭은 agent (GPT) 영역
 - 실패 row도 메타 살림 (parse_errors 격리 또는 parse_status='error')
 - 멱등성: 5분 tick + sha256 + ON CONFLICT
+
+장비 유지보수 데이터 (equipment 스키마, 별도 웹앱이 운영):
+- equipment.equipments: 장비 마스터 (VO2 공정 관련은 id 3=CH1 Sputter, 7=Rayvac ALD, 8=NCD ALD)
+- equipment.equipment_logs: 수리/벤트/클리닝 이벤트 로그 (event_type='repair'|'vent'|'cleaning')
+- 공정 데이터와 직접 FK 없음. timestamp(KST) 기반 연관 분석만 가능.
+- 활용 예: 'sputter run 직전 N일 내 장비 유지보수 있었나'를
+  equipment_logs.occurred_at 과 sputter_runs_auto_main.process_datetime 비교로 판단.
 """
 
 SAMPLE_MAPPING_GUIDE = """
@@ -144,6 +151,33 @@ FROM vo2.measurements
 WHERE parse_status='error'
 ORDER BY id DESC;""",
     },
+    {
+        "question": "VO2 공정 장비(CH1 Sputter, Rayvac/NCD ALD)의 최근 수리/벤트/클리닝 이력",
+        "sql": """SELECT l.id, e.name AS equipment, l.event_type, l.occurred_at,
+       l.operator, l.status, l.description,
+       l.symptom, l.replaced_parts, l.is_external, l.vendor_name,
+       l.vent_reason, l.cleaning_type, l.next_scheduled_at, l.completed_at
+FROM equipment.equipment_logs l
+JOIN equipment.equipments e ON e.id = l.equipment_id
+WHERE l.equipment_id IN (3, 7, 8)
+  AND l.status = '완료'
+ORDER BY l.occurred_at DESC
+LIMIT 50;""",
+    },
+    {
+        "question": "특정 sputter run 직전 7일간 CH1 Sputter 유지보수 이력 (timestamp 기반 연관)",
+        "sql": """WITH target_run AS (
+    SELECT id, process_datetime FROM vo2.sputter_runs_auto_main WHERE id = 1
+)
+SELECT l.event_type, l.occurred_at, l.status, l.description,
+       l.vent_reason, l.cleaning_type, l.symptom
+FROM equipment.equipment_logs l, target_run r
+WHERE l.equipment_id = 3
+  AND l.status = '완료'
+  AND l.occurred_at BETWEEN r.process_datetime - INTERVAL '7 days'
+                        AND r.process_datetime
+ORDER BY l.occurred_at DESC;""",
+    },
 ]
 
 
@@ -221,6 +255,96 @@ TABLE_META = {
 }
 
 
+# ─────────── equipment 스키마 (외부 앱 소유, read-only) ───────────
+# 가공/매핑 없이 그대로 노출. GPT가 raw로 판단.
+
+EQUIPMENT_TABLE_META = {
+    "equipments": {
+        "purpose": "장비 마스터. sputter/ALD/evaporator/furnace 등 8장비 등록.",
+        "domain_notes": (
+            "한 row = 한 장비. category로 그룹 (Sputter/ALD/Evaporator/Furnace).\n"
+            "VO2 공정 관련 장비: id=3 CH1 Sputter (메인), id=7 Rayvac ALD, id=8 NCD ALD.\n"
+            "VO2 비관련: id=4 CH2 Sputter, id=5 CHK Sputter, id=6 In-Line Sputter, id=9 Evaporator, id=10 Furnace.\n"
+            "vent_interval_days/cleaning_interval_days: 현재 모두 0으로 미설정 — 주기 기반 분석에 사용 불가.\n"
+            "description: 보통 NULL (운영자가 채우지 않음)."
+        ),
+        "key_columns": ["id", "name", "category", "is_active", "is_vent_target", "is_cleaning_target"],
+    },
+    "equipment_logs": {
+        "purpose": "장비 이벤트(수리/벤트/클리닝) 메인 로그. 한 row = 한 이벤트.",
+        "domain_notes": (
+            "event_type 값:\n"
+            "  - 'repair'   : 수리 (symptom/replaced_parts/is_external/vendor_name 사용)\n"
+            "  - 'vent'     : 벤트 (vent_reason 사용)\n"
+            "  - 'cleaning' : 클리닝 (cleaning_type 사용)\n"
+            "status: '처리중'(default) / '완료'. '완료'만 신뢰할 만한 이벤트.\n"
+            "occurred_at: timestamp WITHOUT time zone — KST 가정 (운영자 직접 입력).\n"
+            "completed_at: timestamp WITH time zone — '완료' 처리한 시각.\n"
+            "is_external=true면 외주 수리 (vendor_name에 업체명).\n"
+            "vent_reason/cleaning_type은 자유 입력 VARCHAR (FK 아님). "
+            "vent_reason_options/cleaning_type_options에 권장 라벨 있으나 강제 안 됨 — 필터 시 fuzzy 매칭.\n"
+            "description에 운영자가 자연어로 풍부한 메모 남김 (수리 원인/조치, 무게 변화 등). 분석 시 핵심.\n"
+            "VO2 분석은 equipment_id IN (3, 7, 8) 으로 필터."
+        ),
+        "key_columns": ["id", "equipment_id", "event_type", "occurred_at", "status", "operator", "description"],
+    },
+    "equipment_log_entries": {
+        "purpose": "equipment_logs의 진행 메모(시간순). '처리중' 상태에서 경과 기록용.",
+        "domain_notes": (
+            "한 log_id 당 0개 이상의 메모. 현재 운영에서 거의 사용 안 됨 (0건)."
+        ),
+        "key_columns": ["id", "log_id", "occurred_at"],
+    },
+    "equipment_photos": {
+        "purpose": "equipment_logs에 첨부된 사진 메타데이터.",
+        "domain_notes": (
+            "메타만 노출 (file_name/mime_type/file_size/created_at). "
+            "원본 base64(file_data)는 vo2_reader 권한에서 차단 — 토큰 폭발 방지."
+        ),
+        "key_columns": ["id", "log_id", "file_name", "file_size"],
+    },
+    "equipment_entry_photos": {
+        "purpose": "equipment_log_entries에 첨부된 사진 메타데이터.",
+        "domain_notes": (
+            "log_entries가 거의 미사용이라 사실상 빈 상태. file_data 차단됨."
+        ),
+        "key_columns": ["id", "entry_id", "file_name"],
+    },
+    "cleaning_type_options": {
+        "purpose": "클리닝 종류 권장 라벨. equipment_logs.cleaning_type의 후보값.",
+        "domain_notes": (
+            "FK 아님 — 자유 VARCHAR. 현재 4종: '정기 클리닝', '챔버 세정', '비정기', '기타'."
+        ),
+        "key_columns": ["id", "label"],
+    },
+    "vent_reason_options": {
+        "purpose": "벤트 사유 권장 라벨. equipment_logs.vent_reason의 후보값.",
+        "domain_notes": (
+            "FK 아님 — 자유 VARCHAR. 현재 5종: '타겟 교체', '정기 점검', '수리', '클리닝', '기타'."
+        ),
+        "key_columns": ["id", "label"],
+    },
+}
+
+
+# vo2 + equipment 통합 lookup
+ALL_TABLE_META = {
+    **{f"vo2.{k}": v for k, v in TABLE_META.items()},
+    **{f"equipment.{k}": v for k, v in EQUIPMENT_TABLE_META.items()},
+}
+
+
+def _resolve_qualified(table: str) -> str | None:
+    """'equipments' → 'equipment.equipments', 'measurements' → 'vo2.measurements'.
+    'vo2.X' / 'equipment.X' 형태는 그대로. 없으면 None."""
+    if "." in table:
+        return table if table in ALL_TABLE_META else None
+    for cand in (f"vo2.{table}", f"equipment.{table}"):
+        if cand in ALL_TABLE_META:
+            return cand
+    return None
+
+
 # ─────────── 메인 ───────────
 
 def run(table: str | None = None) -> dict[str, Any]:
@@ -239,32 +363,33 @@ def run(table: str | None = None) -> dict[str, Any]:
 
 
 def _describe_all() -> dict[str, Any]:
-    """전체 11개 테이블 요약."""
+    """전체 테이블 요약 (vo2 11개 + equipment 7개 = 18개)."""
     table_summaries = []
 
     with reader_session() as s:
-        for tbl, meta in TABLE_META.items():
+        for qualified, meta in ALL_TABLE_META.items():
+            schema_name, tbl = qualified.split(".", 1)
             row_count = s.execute(
-                text(f"SELECT COUNT(*) FROM vo2.{tbl}")
+                text(f"SELECT COUNT(*) FROM {qualified}")
             ).scalar_one()
             col_count = s.execute(
                 text(
                     "SELECT COUNT(*) FROM information_schema.columns "
-                    "WHERE table_schema='vo2' AND table_name=:t"
+                    "WHERE table_schema=:s AND table_name=:t"
                 ),
-                {"t": tbl},
+                {"s": schema_name, "t": tbl},
             ).scalar_one()
             unique_def = s.execute(
                 text(
                     "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                    "WHERE contype='u' AND connamespace='vo2'::regnamespace "
-                    "AND conrelid = ('vo2.' || :t)::regclass LIMIT 1"
+                    "WHERE contype='u' AND connamespace=(:s)::regnamespace "
+                    "AND conrelid = (:s || '.' || :t)::regclass LIMIT 1"
                 ),
-                {"t": tbl},
+                {"s": schema_name, "t": tbl},
             ).scalar_one_or_none()
 
             table_summaries.append({
-                "table": f"vo2.{tbl}",
+                "table": qualified,
                 "purpose": meta["purpose"],
                 "domain_notes": meta["domain_notes"],
                 "key_columns": meta["key_columns"],
@@ -274,9 +399,9 @@ def _describe_all() -> dict[str, Any]:
             })
 
     return {
-        "schema": "vo2",
+        "schemas": ["vo2", "equipment"],
         "database": "inventory",
-        "total_tables": len(TABLE_META),
+        "total_tables": len(ALL_TABLE_META),
         "domain_overview": DOMAIN_OVERVIEW.strip(),
         "sample_mapping_guide": SAMPLE_MAPPING_GUIDE.strip(),
         "common_queries": COMMON_QUERIES,
@@ -290,10 +415,16 @@ def _describe_all() -> dict[str, Any]:
             "source_files.id ← sputter_runs_auto_plasma.source_file_id (SET NULL)",
             "source_files.id ← rga_runs.source_file_id",
             "measurements: NO FK — 자체 트리 traversal로 적재, file_path UNIQUE",
+            "equipment.equipments.id ← equipment.equipment_logs.equipment_id (외부 앱 FK)",
+            "equipment.equipment_logs.id ← equipment.equipment_photos.log_id",
+            "equipment.equipment_logs.id ← equipment.equipment_log_entries.log_id",
+            "equipment.equipment_log_entries.id ← equipment.equipment_entry_photos.entry_id",
+            "vo2 ↔ equipment: FK 없음. timestamp(KST) 기반 연관 분석만 가능.",
         ],
         "next_step_hint": (
             "특정 테이블 상세 (모든 컬럼 타입 + 예시 5 row)는 "
-            "describe_schema(table='ald_ncd_runs') 형태로 호출. "
+            "describe_schema(table='ald_ncd_runs') 또는 "
+            "describe_schema(table='equipment_logs') 형태로 호출. "
             "분석 SQL은 run_sql(sql='SELECT ...'). "
             "시계열 raw 배열은 get_timeseries(table='measurements'|'rga_runs', row_id=N)."
         ),
@@ -301,15 +432,17 @@ def _describe_all() -> dict[str, Any]:
 
 
 def _describe_one(table: str) -> dict[str, Any]:
-    """특정 테이블 상세."""
-    if table not in TABLE_META:
+    """특정 테이블 상세. vo2 / equipment 둘 다 지원.
+    bare name 주면 자동으로 스키마 추론. 'vo2.X' 또는 'equipment.X'도 OK."""
+    qualified = _resolve_qualified(table)
+    if qualified is None:
         return {
             "error": f"unknown table: {table!r}. "
-                     f"available: {list(TABLE_META.keys())}",
+                     f"available: {list(ALL_TABLE_META.keys())}",
         }
 
-    meta = TABLE_META[table]
-    qualified = f"vo2.{table}"
+    meta = ALL_TABLE_META[qualified]
+    schema_name, table_name = qualified.split(".", 1)
 
     with reader_session() as s:
         # 컬럼 정보
@@ -323,36 +456,40 @@ def _describe_one(table: str) -> dict[str, Any]:
                     is_nullable,
                     column_default
                 FROM information_schema.columns
-                WHERE table_schema='vo2' AND table_name=:t
+                WHERE table_schema=:s AND table_name=:t
                 ORDER BY ordinal_position
             """),
-            {"t": table},
+            {"s": schema_name, "t": table_name},
         ).mappings().all()
 
         # 제약
         unique_def = s.execute(
             text(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE contype='u' AND connamespace='vo2'::regnamespace "
-                "AND conrelid = ('vo2.' || :t)::regclass LIMIT 1"
+                "WHERE contype='u' AND connamespace=(:s)::regnamespace "
+                "AND conrelid = (:s || '.' || :t)::regclass LIMIT 1"
             ),
-            {"t": table},
+            {"s": schema_name, "t": table_name},
         ).scalar_one_or_none()
 
         fk_defs = s.execute(
             text(
                 "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-                "WHERE contype='f' AND connamespace='vo2'::regnamespace "
-                "AND conrelid = ('vo2.' || :t)::regclass"
+                "WHERE contype='f' AND connamespace=(:s)::regnamespace "
+                "AND conrelid = (:s || '.' || :t)::regclass"
             ),
-            {"t": table},
+            {"s": schema_name, "t": table_name},
         ).scalars().all()
 
         # row 수
         row_count = s.execute(text(f"SELECT COUNT(*) FROM {qualified}")).scalar_one()
 
-        # 예시 5 row — 큰 컬럼 (raw_json, raw_data, jsonb, 배열, 시계열) 제외
-        large_cols = {"raw_json", "raw_data", "temperature_c", "resistance_ohm", "intensity", "metadata", "arguments", "result_summary"}
+        # 예시 5 row — 큰 컬럼 (raw_json, raw_data, jsonb, 배열, 시계열, base64 사진) 제외
+        large_cols = {
+            "raw_json", "raw_data", "temperature_c", "resistance_ohm", "intensity",
+            "metadata", "arguments", "result_summary",
+            "file_data",  # equipment_photos / equipment_entry_photos의 base64
+        }
         select_cols = [c["column_name"] for c in columns if c["column_name"] not in large_cols]
         select_clause = ", ".join(f'"{c}"' for c in select_cols) if select_cols else "*"
 
@@ -384,7 +521,7 @@ def _describe_one(table: str) -> dict[str, Any]:
             for row in sample_rows
         ],
         "sample_note": (
-            "raw_json/raw_data/배열/시계열 컬럼은 예시에서 제외됨. "
+            "raw_json/raw_data/배열/시계열/file_data(base64) 컬럼은 예시에서 제외됨. "
             "전체 보려면 run_sql 또는 get_timeseries 사용."
         ),
     }

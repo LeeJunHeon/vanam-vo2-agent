@@ -62,21 +62,28 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
     """VO2 공정 DB의 schema/도메인 지식/예시 row를 한 번에 반환.
 
     분석을 시작할 때 처음 호출하면 DB 전체 그림을 잡을 수 있다.
+    vo2 스키마(공정 데이터) + equipment 스키마(장비 유지보수) 두 곳 모두 지원.
 
     Args:
-        table: 조회할 테이블 (vo2. prefix 없이).
-            None이면 전체 11개 테이블 요약 + 도메인 overview + sample 매핑 가이드
+        table: 조회할 테이블. bare name이면 스키마 자동 추론 (예: 'measurements', 'equipment_logs').
+            'vo2.X' / 'equipment.X' 형태로 명시 가능.
+            None이면 전체 18개 테이블 요약 + 도메인 overview + sample 매핑 가이드
             + 자주 쓰는 쿼리 예시.
-            테이블 이름 주면 (예: 'measurements') 그 테이블의 모든 컬럼/타입/예시 5 row.
 
     사용 가능 테이블:
+        [vo2 스키마 — 공정 데이터]
         source_files, etl_runs, mcp_audit_logs, parse_errors,
         ald_ncd_runs, ald_rayvac_runs,
         sputter_runs_human, sputter_runs_auto_main, sputter_runs_auto_plasma,
         measurements, rga_runs
 
+        [equipment 스키마 — 장비 유지보수 (read-only)]
+        equipments, equipment_logs, equipment_log_entries,
+        equipment_photos, equipment_entry_photos,
+        cleaning_type_options, vent_reason_options
+
     Returns:
-        전체 모드: {schema, database, total_tables, domain_overview,
+        전체 모드: {schemas, database, total_tables, domain_overview,
                     sample_mapping_guide, common_queries, tables, relationships}
         상세 모드: {table, purpose, domain_notes, row_count, unique_constraint,
                     foreign_keys, key_columns, columns, sample_rows}

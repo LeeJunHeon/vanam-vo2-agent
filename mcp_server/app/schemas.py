@@ -20,8 +20,10 @@ class DescribeSchemaRequest(BaseModel):
     table: str | None = Field(
         default=None,
         description=(
-            "조회할 테이블 이름 (vo2. prefix 없이). "
-            "None이면 전체 11개 테이블 요약 + 도메인 지식 + 관계 + 자주 쓰는 쿼리 예시. "
+            "조회할 테이블 이름. bare name이면 스키마 자동 추론 "
+            "(예: 'measurements' → vo2.measurements, 'equipment_logs' → equipment.equipment_logs). "
+            "'vo2.X' / 'equipment.X' 형태로 명시 가능. "
+            "None이면 전체 18개 테이블 요약 (vo2 11 + equipment 7) + 도메인 지식 + 관계 + 자주 쓰는 쿼리 예시. "
             "테이블 이름 주면 그 테이블의 모든 컬럼/타입/예시 5 row."
         ),
     )
