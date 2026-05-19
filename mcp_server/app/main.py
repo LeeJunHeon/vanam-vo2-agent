@@ -89,10 +89,10 @@ def _describe_schema(
     req: DescribeSchemaRequest,
     _token: str = Depends(require_token),
 ) -> dict[str, Any]:
-    """vo2 schema 구조 + 도메인 지식 + 예시 row.
+    """vo2 + equipment schema 구조 + 도메인 지식 + 예시 row.
 
-    table=None: 전체 11개 테이블 요약 + 관계 + 도메인 overview + 자주 쓰는 쿼리.
-    table=<이름>: 특정 테이블 상세 (모든 컬럼 + 예시 5 row).
+    table=None: 전체 18개 테이블 요약 (vo2 11 + equipment 7) + 관계 + 도메인 overview + 자주 쓰는 쿼리.
+    table=<이름>: 특정 테이블 상세 (모든 컬럼 + 예시 5 row). bare name이면 스키마 자동 추론.
 
     분석 시작 시 처음 호출 권장.
     """
@@ -106,6 +106,8 @@ def _run_sql(
 ) -> dict[str, Any]:
     """자유 SELECT (read-only, vo2_reader 권한).
 
+    대상 스키마: vo2.* (공정 데이터) + equipment.* (장비 유지보수). cross-schema JOIN 가능.
+
     안전 장치:
     - SELECT 또는 WITH...SELECT만
     - 데이터 변경 명령 차단
@@ -113,6 +115,7 @@ def _run_sql(
     - 자동 LIMIT (기본 100, 최대 1000)
     - 10초 타임아웃
     - 배열/큰 JSONB는 요약만
+    - equipment.equipment_photos / equipment_entry_photos의 file_data(base64)는 DB 권한에서 차단
 
     배열 raw가 필요하면 get_timeseries 호출.
     """

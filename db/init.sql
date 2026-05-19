@@ -390,3 +390,23 @@ GRANT USAGE, SELECT ON SEQUENCE
     vo2.sputter_runs_auto_main_id_seq,
     vo2.sputter_runs_auto_plasma_id_seq
     TO vo2_writer;
+
+-- ──────────────────────────────────────────────────────────────────────────
+-- equipment schema 권한 (외부 앱 소유, vo2_reader가 read-only 조회)
+-- ──────────────────────────────────────────────────────────────────────────
+-- 운영자가 DBeaver로 직접 적용한 GRANT의 문서적 기록.
+-- equipment 스키마는 별도 웹앱이 운영하며, vo2-agent는 read-only로만 join 사용.
+-- equipment_photos/equipment_entry_photos의 file_data(base64) 컬럼은 차단 (토큰 폭발 방지).
+
+GRANT USAGE ON SCHEMA equipment TO vo2_reader;
+
+GRANT SELECT ON equipment.equipments              TO vo2_reader;
+GRANT SELECT ON equipment.equipment_logs          TO vo2_reader;
+GRANT SELECT ON equipment.equipment_log_entries   TO vo2_reader;
+GRANT SELECT ON equipment.cleaning_type_options   TO vo2_reader;
+GRANT SELECT ON equipment.vent_reason_options     TO vo2_reader;
+
+GRANT SELECT (id, log_id, file_name, mime_type, file_size, created_at)
+  ON equipment.equipment_photos        TO vo2_reader;
+GRANT SELECT (id, entry_id, file_name, mime_type, file_size, created_at)
+  ON equipment.equipment_entry_photos  TO vo2_reader;

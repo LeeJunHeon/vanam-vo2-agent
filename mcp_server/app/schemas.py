@@ -40,10 +40,11 @@ class RunSqlRequest(BaseModel):
     sql: str = Field(
         description=(
             "SELECT 또는 WITH...SELECT query. "
-            "vo2 schema의 read-only 권한. "
+            "vo2.* + equipment.* schema의 read-only 권한 (cross-schema JOIN 가능). "
             "INSERT/UPDATE/DELETE/DROP/ALTER 등 차단. "
             "세미콜론 multi-statement 차단. "
-            "배열/큰 JSONB는 요약만 반환 (raw는 get_timeseries 사용)."
+            "배열/큰 JSONB는 요약만 반환 (raw는 get_timeseries 사용). "
+            "equipment.equipment_photos / equipment_entry_photos의 file_data 컬럼은 DB 권한에서 차단."
         ),
     )
     max_rows: int = Field(

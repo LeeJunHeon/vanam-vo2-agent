@@ -93,7 +93,7 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
 
 @mcp.tool(
     annotations=ToolAnnotations(
-        title="Run read-only SQL on vo2 schema",
+        title="Run read-only SQL on vo2 + equipment schemas",
         readOnlyHint=True,
         destructiveHint=False,
         idempotentHint=True,
@@ -101,7 +101,12 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
     )
 )
 def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
-    """vo2 schema에 read-only SELECT 실행.
+    """vo2 + equipment schema에 read-only SELECT 실행.
+
+    대상 스키마:
+    - vo2.* : VO2 박막 공정 데이터 (ALD/sputter/measurement/RGA)
+    - equipment.* : 장비 유지보수 (수리/벤트/클리닝 이벤트, 사진 메타)
+    - cross-schema JOIN 가능 (FK 없고 timestamp 기반 연관만)
 
     안전 장치 (PostgreSQL vo2_reader 권한 + 추가 검증):
     - SELECT 또는 WITH...SELECT만 허용
@@ -111,11 +116,12 @@ def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
     - 10초 statement_timeout
     - 배열 컬럼 (temperature_c, resistance_ohm, intensity)은 길이/preview만 반환
     - 큰 JSONB는 keys + size만 반환
+    - equipment.equipment_photos / equipment_entry_photos의 file_data(base64)는 DB 권한에서 차단
 
     배열/시계열 raw가 필요하면 get_timeseries 도구 사용.
 
     Args:
-        sql: SELECT 또는 WITH...SELECT 문. vo2.* 테이블 대상.
+        sql: SELECT 또는 WITH...SELECT 문. vo2.* 또는 equipment.* 테이블 대상.
         max_rows: 1~1000, 기본 100.
 
     Returns:

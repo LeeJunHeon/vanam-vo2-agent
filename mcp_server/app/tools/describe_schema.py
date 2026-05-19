@@ -1,8 +1,9 @@
 """describe_schema 도구 — DB schema + 도메인 지식 + 예시 row.
 
 호출 패턴:
-- describe_schema()         → 전체 11개 테이블 요약 + 관계 + 도메인 overview
-- describe_schema(table=X)  → 특정 테이블 모든 컬럼 + 예시 5 row (raw_json 제외)
+- describe_schema()         → 전체 18개 테이블 요약 (vo2 11 + equipment 7) + 관계 + 도메인 overview
+- describe_schema(table=X)  → 특정 테이블 모든 컬럼 + 예시 5 row (raw_json/배열/file_data 제외)
+                              bare name이면 스키마 자동 추론 ('vo2.X' / 'equipment.X' 명시도 가능)
 
 agent가 SQL 짜기 전 "이 DB가 뭘 담고 있나?" 이해할 수 있도록 설계.
 hybrid 패턴: agent system prompt에 요약 박혀있고, 깊이 분석 시 이 도구로 상세 조회.
