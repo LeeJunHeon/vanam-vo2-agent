@@ -84,6 +84,25 @@ WHERE o.id = matched.oes_id
 """)
 
 
+# Step 27 동기화 철학을 parse_errors 까지 확장:
+# 현재 latest sha 아닌 source_file 의 unresolved 격리 row 는 자동 resolved 마크.
+# (Step 27 의 DELETE+INSERT 는 ald_*_runs / sputter_runs_* / rga_runs 만 동기화,
+#  parse_errors 는 누적만 됨 → housekeeping 으로 일관성 확보)
+_HOUSEKEEPING_PARSE_ERRORS_SQL = text("""
+    UPDATE vo2.parse_errors
+       SET resolved = true,
+           resolved_at = NOW(),
+           resolved_note = 'auto: superseded by newer sha (housekeeping)'
+     WHERE source_file_id NOT IN (
+        SELECT DISTINCT ON (source_type, file_path) id
+          FROM vo2.source_files
+         WHERE source_type IN ('ald_ncd_xlsx', 'ald_rayvac_xlsx')
+         ORDER BY source_type, file_path, last_indexed_at DESC
+     )
+     AND NOT resolved
+""")
+
+
 def _rematch_oes_to_sputter_auto() -> int:
     """OES rows with NULL sputter_auto_main_id 를 재매칭.
 
@@ -109,6 +128,35 @@ def _rematch_oes_to_sputter_auto() -> int:
         return n
     except Exception as e:
         log.warning(f"OES sputter_auto FK 재매칭 실패 (무시): {type(e).__name__}: {e}")
+        return 0
+
+
+def _housekeeping_parse_errors() -> int:
+    """옛 sha 의 unresolved parse_errors 를 자동 resolved 마크.
+
+    Step 27 의 DELETE+INSERT 동기화 철학이 ald_*_runs / sputter_runs_* / rga_runs
+    에는 적용됐지만 parse_errors 는 누적만 되어 옛 sha 의 격리 row 가 잔재.
+
+    매 tick 끝에 호출 — 현재 NAS 의 latest sha 아닌 source_file 에 매달린
+    parse_errors 는 정의상 '옛 xlsx 의 흔적'이라 자동 resolved.
+
+    운영자 SELECT WHERE NOT resolved 결과는 항상 '현재 xlsx 의 진짜 문제 row'
+    만 보이게 됨.
+
+    Returns:
+        resolved 마크된 row 수
+    """
+    try:
+        with session_scope_writer() as s:
+            result = s.execute(_HOUSEKEEPING_PARSE_ERRORS_SQL)
+            n = result.rowcount or 0
+            if n > 0:
+                log.info(f"parse_errors housekeeping: {n} stale row auto-resolved")
+            return n
+    except Exception as e:
+        log.warning(
+            f"parse_errors housekeeping 실패 (무시): {type(e).__name__}: {e}"
+        )
         return 0
 
 
@@ -225,6 +273,15 @@ def sync_all() -> dict:
             files_processed += dataset_result.get("files_inserted", 0)
             rows_inserted += dataset_result.get("samples_inserted", 0)
             rows_inserted += dataset_result.get("samples_with_error", 0)
+
+        # Step 28-pre-3: parse_errors 자동 housekeeping (Step 27 동기화 철학 확장)
+        # 현재 latest sha 가 아닌 source_file 에 매달린 unresolved row 를 auto-resolved.
+        housekeeping_n = _housekeeping_parse_errors()
+        parser_results.append({
+            "file": "parse_errors_housekeeping",
+            "status": "ok",
+            "resolved": housekeeping_n,
+        })
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
