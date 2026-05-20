@@ -40,7 +40,7 @@ import hashlib
 import logging
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -65,6 +65,13 @@ DATE_RE = re.compile(r'^\d{8}$')
 
 # Batch commit 단위 (메모리 안전)
 BATCH_SIZE = 100
+
+# 방어막 ①: 후보 단계 race guard (header_only 중복 적재 방지)
+MIN_DAT_SIZE_BYTES = 100              # 헤더만 적힌 상태(~22 byte) 차단. 정상 측정 최소 5.8KB라 안전
+DISCOVER_MTIME_GRACE_SECONDS = 60     # 60초 이내 mtime은 장비 쓰기 진행 중 가능성
+
+# 방어막 ②: INSERT 직전 안전망
+HEADER_ONLY_GRACE_HOURS = 24          # 24h 안쪽 header_only는 race로 간주 skip, 24h+ 는 진짜 실패로 error 격리
 
 # sha256 chunk
 _CHUNK = 64 * 1024
@@ -223,6 +230,35 @@ def _discover_dat_files(base_path: Path) -> list[tuple[Path, str, int]]:
             except ValueError:
                 continue
 
+            # 방어막 ① — race / 쓰기 진행 중 후보 제외
+            full_path = Path(dirpath) / fname
+            try:
+                st = full_path.stat()
+            except OSError as e:
+                log.warning(f"stat failed for {full_path}: {type(e).__name__}: {e}")
+                continue
+
+            file_size = st.st_size
+            file_mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+            now = datetime.now(timezone.utc)
+            age_seconds = (now - file_mtime).total_seconds()
+
+            # 1A: 매우 작은 파일이고 mtime이 24h 안쪽이면 race 가능성 → 후보 제외
+            # (24h+ 이면 진짜 실패 가능성이라 후보에 넣어 방어막 ②가 error로 격리)
+            if file_size < MIN_DAT_SIZE_BYTES and age_seconds < HEADER_ONLY_GRACE_HOURS * 3600:
+                log.debug(
+                    f"discover skip race: {full_path} "
+                    f"size={file_size} byte, age={age_seconds/60:.1f} min"
+                )
+                continue
+
+            # 1B: mtime이 60초 안쪽이면 장비가 쓰기 진행 중 → 후보 제외
+            if age_seconds < DISCOVER_MTIME_GRACE_SECONDS:
+                log.debug(
+                    f"discover skip recent mtime: {full_path} age={age_seconds:.1f}s"
+                )
+                continue
+
             existing = groups.get(base)
             if existing is None or existing[0] < n:
                 groups[base] = (n, fname)
@@ -319,24 +355,61 @@ def _process_one_file(s, file_path: Path, base_name: str, suffix_n: int, counter
         counters['fully_failed'] += 1
         return
 
-    # 1단계: 정상 INSERT 시도 (savepoint 1)
+    # 1단계: 파싱 (savepoint 1)
     error_msg = None
+    parse_status = None
+    raw_header = ''
+    temps: list = []
+    resistances: list = []
+
     try:
         with s.begin_nested():
             raw_header, temps, resistances = _parse_dat_content(file_path)
-            parse_status = 'ok' if temps else 'header_only'
-            payload = _build_payload(
-                file_path, suffix_n, sha, file_size, file_mtime,
-                raw_header, temps, resistances, parse_status,
-            )
-            s.execute(_INSERT_SQL, payload)
-        counters['files_inserted'] += 1
-        return
+        parse_status = 'ok' if temps else 'header_only'
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
-        log.warning(f"failed to insert {file_path}: {error_msg[:200]}")
+        log.warning(f"failed to parse {file_path}: {error_msg[:200]}")
+        parse_status = 'error'
 
-    # 2단계: 격리 INSERT (메타만, 시계열 NULL, parse_status='error') (savepoint 2)
+    # 1.5단계: 방어막 ② — header_only race-aware 분기
+    if parse_status == 'header_only':
+        if file_mtime is None:
+            log.debug(f"skip header_only {file_path} (mtime unknown)")
+            counters['skipped_header_only'] += 1
+            return
+        age_hours = (datetime.now(timezone.utc) - file_mtime).total_seconds() / 3600
+        if age_hours < HEADER_ONLY_GRACE_HOURS:
+            log.info(
+                f"skip header_only {file_path.name} "
+                f"(age {age_hours:.1f}h < {HEADER_ONLY_GRACE_HOURS}h, likely race)"
+            )
+            counters['skipped_header_only'] += 1
+            return
+        # 24h+ 지속 → 진짜 측정 실패로 간주, error 격리로 fall through
+        error_msg = (
+            f"header_only persisted >{HEADER_ONLY_GRACE_HOURS}h "
+            f"(mtime={file_mtime.isoformat()}, size={file_size}). "
+            f"진짜 측정 실패 가능성 — 운영자 확인 필요."
+        )
+        parse_status = 'error'
+
+    # 2단계: ok 만 정상 INSERT
+    if parse_status == 'ok':
+        try:
+            with s.begin_nested():
+                payload = _build_payload(
+                    file_path, suffix_n, sha, file_size, file_mtime,
+                    raw_header, temps, resistances, 'ok',
+                )
+                s.execute(_INSERT_SQL, payload)
+                counters['files_inserted'] += 1
+                return
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            log.warning(f"failed to insert {file_path}: {error_msg[:200]}")
+            # fall through 격리 INSERT
+
+    # 3단계: 격리 INSERT (parse_status='error', 시계열 NULL) — 기존 2단계 로직 그대로
     try:
         with s.begin_nested():
             payload = _build_payload(
@@ -346,7 +419,7 @@ def _process_one_file(s, file_path: Path, base_name: str, suffix_n: int, counter
                 'error',
             )
             s.execute(_INSERT_SQL, payload)
-        counters['files_with_error'] += 1
+            counters['files_with_error'] += 1
     except Exception as e2:
         log.error(f"isolation INSERT also failed for {file_path}: {type(e2).__name__}: {e2}")
         counters['fully_failed'] += 1
@@ -393,9 +466,10 @@ def parse_measurements_tree() -> dict:
     log.info(f"discovered {files_seen} candidate .dat files (max-N selected per group)")
 
     counters = {
-        'files_inserted': 0,    # parse_status='ok' or 'header_only'
-        'files_with_error': 0,  # parse_status='error' (격리 INSERT 성공)
-        'fully_failed': 0,      # 격리 INSERT도 실패 (sha 못 채운 경우 등)
+        'files_inserted': 0,        # parse_status='ok'
+        'files_with_error': 0,      # parse_status='error' (격리 INSERT 성공)
+        'fully_failed': 0,          # 격리 INSERT도 실패 (sha 못 채운 경우 등)
+        'skipped_header_only': 0,   # 방어막 ② skip 카운트 (24h 안쪽 header_only race)
     }
 
     for batch_idx in range(0, files_seen, BATCH_SIZE):
@@ -411,7 +485,8 @@ def parse_measurements_tree() -> dict:
         f"=== measurements_tree done: "
         f"+{counters['files_inserted']} ok, "
         f"+{counters['files_with_error']} error-isolated, "
-        f"{counters['fully_failed']} fully-failed "
+        f"{counters['fully_failed']} fully-failed, "
+        f"{counters['skipped_header_only']} skipped-header-only, "
         f"(of {files_seen} candidates) ==="
     )
     return {
@@ -420,4 +495,5 @@ def parse_measurements_tree() -> dict:
         "files_inserted": counters['files_inserted'],
         "files_with_error": counters['files_with_error'],
         "fully_failed": counters['fully_failed'],
+        "skipped_header_only": counters['skipped_header_only'],
     }
