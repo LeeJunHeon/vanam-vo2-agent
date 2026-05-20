@@ -40,7 +40,7 @@ import hashlib
 import logging
 import os
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -335,9 +335,9 @@ _INSERT_SQL = text("""
 # ─────────── 한 row 처리 ───────────
 
 def _process_one_file(s, file_path: Path, base_name: str, suffix_n: int, counters: dict) -> None:
-    """한 .dat 처리. 정상/에러 격리 분기 모두 처리.
+    """한 .dat 처리. 정상/에러 격리/race skip 분기 모두 처리.
 
-    counters: {'files_inserted', 'files_with_error', 'fully_failed'}
+    counters: {'files_inserted', 'files_with_error', 'fully_failed', 'skipped_header_only'}
     """
     # 메타 추출 (파일 stat + sha — 거의 실패 안 함)
     file_size = None
@@ -444,6 +444,7 @@ def parse_measurements_tree() -> dict:
             "files_inserted": 0,
             "files_with_error": 0,
             "fully_failed": 0,
+            "skipped_header_only": 0,
         }
 
     log.info(f"=== measurements_tree start: {base} ===")
@@ -460,6 +461,7 @@ def parse_measurements_tree() -> dict:
             "files_inserted": 0,
             "files_with_error": 0,
             "fully_failed": 0,
+            "skipped_header_only": 0,
         }
 
     files_seen = len(candidates)

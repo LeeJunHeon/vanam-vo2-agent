@@ -1,10 +1,11 @@
 """ETL orchestrator — scan_files → parser → etl_runs 기록.
 
-처리 순서 (5분 tick마다):
+처리 순서 (매일 05:00 KST tick — Step 28-pre-1 변경):
 1. etl_runs INSERT (job_name='sync_sputter', status='running')
 2. scan_all() → SourceFileRecord list (sha256, mtime, race-safe)
 3. source_type별 파서 호출
-4. etl_runs UPDATE (status, files/rows 통계, parser_results를 metadata JSONB에)
+4. parse_errors housekeeping (옛 sha stale row auto-resolved)
+5. etl_runs UPDATE (status, files/rows 통계, parser_results를 metadata JSONB에)
 
 전략: ETL은 xlsx → DB 단순 복사. 해석/매칭은 agent (MCP).
 
@@ -14,9 +15,11 @@ source_type 매핑:
 - ald_ncd_xlsx       → parse_ald_ncd       → ald_ncd_runs
 - ald_rayvac_xlsx    → parse_ald_rayvac    → ald_rayvac_runs
 - rga_csv            → parse_rga_csv       → rga_runs
+- oes_csv            → parse_oes_csv       → oes_runs (sputter_auto 후 처리, 매칭 의존)
 
 별도 트리 traversal (source_files 안 거침):
 - VO2 측정 .dat 트리 → parse_measurements_tree → measurements
+- dataset.dat 트리   → parse_datasets_tree → measurement_summary
 """
 
 import json
@@ -161,7 +164,10 @@ def _housekeeping_parse_errors() -> int:
 
 
 def sync_all() -> dict:
-    """5분 tick의 메인 함수. scan + parse + 통계 기록."""
+    """매일 05:00 KST tick 의 메인 함수. scan + parse + housekeeping + 통계 기록.
+
+    Step 28-pre-1 이후: 하루 1회 실행 (이전엔 5분 cron).
+    """
     log.info("=== sync_sputter tick start ===")
 
     with session_scope_writer() as s:
