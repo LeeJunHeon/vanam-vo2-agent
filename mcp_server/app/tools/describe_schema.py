@@ -1,7 +1,7 @@
 """describe_schema 도구 — DB schema + 도메인 지식 + 예시 row.
 
 호출 패턴:
-- describe_schema()         → 전체 18개 테이블 요약 (vo2 11 + equipment 7) + 관계 + 도메인 overview
+- describe_schema()         → 전체 20개 테이블 요약 (vo2 13 + equipment 7) + 관계 + 도메인 overview
 - describe_schema(table=X)  → 특정 테이블 모든 컬럼 + 예시 5 row (raw_json/배열/file_data 제외)
                               bare name이면 스키마 자동 추론 ('vo2.X' / 'equipment.X' 명시도 가능)
 
@@ -179,6 +179,54 @@ WHERE l.equipment_id = 3
                         AND r.process_datetime
 ORDER BY l.occurred_at DESC;""",
     },
+    {
+        "question": "최근 한 달 박막 12 metric daily trend (R25/R85/dT/TCR — measurement_summary 단독)",
+        "sql": """SELECT
+  measurement_date,
+  COUNT(*) AS n_samples,
+  AVG(r25) AS avg_r25, AVG(r85) AS avg_r85,
+  AVG(r25_r85_ratio) AS avg_ratio,
+  AVG(dt) AS avg_dt,
+  AVG(tcr_h) AS avg_tcr_h, AVG(tcr_c) AS avg_tcr_c,
+  AVG(t_h) AS avg_t_h, AVG(t_c) AS avg_t_c,
+  AVG(tmi) AS avg_tmi, AVG(bse) AS avg_bse, AVG(bsw) AS avg_bsw,
+  MAX(tol_rr) AS tol_rr, MAX(tol_dt) AS tol_dt
+FROM vo2.measurement_summary
+WHERE parse_status='ok'
+  AND measurement_date > NOW() - INTERVAL '30 days'
+GROUP BY measurement_date
+ORDER BY measurement_date DESC;""",
+    },
+    {
+        "question": "OES SPC anomaly run 찾기 (2026-02 이후 코호트, t2_peak / spe_peak 상위)",
+        "sql": """WITH cohort AS (
+  SELECT id, started_at, sputter_auto_main_id,
+         n_peaks_detected, pca_cum_variance, pca_valid,
+         t2_peak, t2_median, spe_peak, spe_median
+  FROM vo2.oes_runs
+  WHERE started_at >= '2026-02-01'
+    AND sputter_auto_main_id IS NOT NULL
+    AND pca_valid = true
+),
+stats AS (
+  SELECT AVG(t2_peak) AS t2_mean, STDDEV(t2_peak) AS t2_std,
+         AVG(spe_peak) AS spe_mean, STDDEV(spe_peak) AS spe_std
+  FROM cohort
+)
+SELECT c.id, c.started_at, c.sputter_auto_main_id,
+       c.n_peaks_detected, c.pca_cum_variance,
+       c.t2_peak, c.spe_peak,
+       ROUND(((c.t2_peak - s.t2_mean) / NULLIF(s.t2_std, 0))::numeric, 2) AS t2_z,
+       ROUND(((c.spe_peak - s.spe_mean) / NULLIF(s.spe_std, 0))::numeric, 2) AS spe_z
+FROM cohort c, stats s
+WHERE c.t2_peak > s.t2_mean + 2*s.t2_std
+   OR c.spe_peak > s.spe_mean + 2*s.spe_std
+ORDER BY GREATEST(
+  (c.t2_peak - s.t2_mean) / NULLIF(s.t2_std, 0),
+  (c.spe_peak - s.spe_mean) / NULLIF(s.spe_std, 0)
+) DESC
+LIMIT 30;""",
+    },
 ]
 
 
@@ -252,6 +300,70 @@ TABLE_META = {
             "raw_json에 전체 65 mass + Time 원본 보존."
         ),
         "key_columns": ["measured_at", "mass_count", "parse_status"],
+    },
+    "measurement_summary": {
+        "purpose": "VO2 박막 측정 폴더의 dataset.dat 계산 결과. 한 row = 한 sample의 12 metric + day-level 6 Tol.",
+        "domain_notes": (
+            "운영자가 raw .dat 측정 후 별도 계산 도구로 dataset.dat 생성 (수정 없음 — 한 번 만들면 끝).\n"
+            "한 dataset.dat 파일 = N sample, 각 sample 당 (raw row + applied row) 2개. 적재 시 합쳐서 1 row.\n"
+            "UNIQUE: (file_path, sha256, sample_id). 격리 INSERT (parse_status='error') 패턴은 measurements와 동일.\n"
+            "\n"
+            "11 metric은 raw row 값, dT는 applied row 값:\n"
+            "  - r25 (Ohm at 25°C), r85 (Ohm at 85°C), r25_r85_ratio (R25/R85 비율, VO2 전이 폭 지표)\n"
+            "  - tmi (Transition Midpoint Index), dt (dT, applied 값 — 전이 폭 °C)\n"
+            "  - tcr_s (TCR slope), tcr_h (TCR heating), tcr_c (TCR cooling) — 온도 저항 계수\n"
+            "  - t_h (transition temp heating), t_c (transition temp cooling)\n"
+            "  - bse (Baseline error), bsw (Baseline width)\n"
+            "\n"
+            "6 Tol (day-level 임계값 — 같은 파일 내 모든 sample row에 동일하게 복사):\n"
+            "  - tol_rr, tol_tcr_h, tol_tcr_c, tol_dt, tol_bse, tol_sw\n"
+            "  - sample의 metric을 이 Tol과 비교해 합/불 판정 (운영자 영역).\n"
+            "\n"
+            "JOIN 한계 — measurements와 sample-level 매칭 어려움:\n"
+            "  - file_dir 일치율 99.7% (같은 폴더에서 dataset.dat 생성). 하지만 sample_id ↔ measurements 식별자 매핑 규칙 없음.\n"
+            "  - 운영자가 dataset.dat 만들 때 sample 순서를 자유롭게 정함 (1.3%만 자연 매칭).\n"
+            "  - 권장: measurement_summary 단독 분석 (daily R25/R85/dT trend, Tol 대비 분포 등).\n"
+            "  - measurements raw 시계열이 필요하면 file_dir로 같은 날 측정 후보 좁히고 agent가 파일명으로 추론.\n"
+            "\n"
+            "raw_json에 raw_row + applied_row dict 원본 보존."
+        ),
+        "key_columns": ["measurement_date", "sample_id", "r25", "r85", "dt", "file_dir", "parse_status"],
+    },
+    "oes_runs": {
+        "purpose": "Sputter chamber OES (Optical Emission Spectroscopy) — 한 sputter run의 plasma spectrum을 PCA로 압축한 SPC 지표.",
+        "domain_notes": (
+            "한 row = 한 OES csv = 한 sputter run. 파일명 'OES_Data_YYYYMMDD_HHMMSS.csv'에서 started_at 추출.\n"
+            "원본 csv: 1014 wavelength × ~1000 timestep (raw 배열은 DB에 저장 안 함, summary만).\n"
+            "\n"
+            "9단계 파이프라인 (pipeline_version='v1.0'):\n"
+            "  1. csv 읽기, started_at 추출\n"
+            "  2. sputter_runs_auto_main 매칭 (±30min nearest, FK sputter_auto_main_id — NULL 가능)\n"
+            "  3. Plasma ON 필터 (total intensity midpoint threshold)\n"
+            "  4. Baseline 제거 (per-channel percentile-5)\n"
+            "  5. Peak 검출 (prominence≥10, distance≥2)\n"
+            "  6. Integration band (peak ± 2 channel 합)\n"
+            "  7. MinMax scaling per peak\n"
+            "  8. PCA n=3 + Hotelling T² + SPE\n"
+            "  9. INSERT (raw 배열 없이 메타+통계만)\n"
+            "\n"
+            "SPC 해석 키:\n"
+            "  - pca_cum_variance ≥ 0.95 → pca_valid=true (모델 신뢰 가능)\n"
+            "  - t2_peak (Hotelling T² 최대값) → run 내 가장 비정상적 시점의 점수. 클수록 평소 운전 패턴에서 벗어남.\n"
+            "  - spe_peak (SPE 최대값) → run 내 모델 잔차 최대값. 클수록 PCA 모델이 설명 못 하는 새 패턴 등장.\n"
+            "  - n_peaks_detected: 보통 5~30. 너무 적으면 plasma 약함, 너무 많으면 noise 많음.\n"
+            "  - peak_wavelengths[] (nm): VO2 sputter 주요 emission line — Ar I (~750~810nm), O I (~777nm), O II, V I, V II.\n"
+            "\n"
+            "코호트 추천 (SPC 모델 일관성):\n"
+            "  - WHERE started_at >= '2026-02-01' AND sputter_auto_main_id IS NOT NULL\n"
+            "  - 2026-02 이전은 옛 시기 (장비 운영 패턴 다름) 또는 매칭 실패 (=장비 로그 정합성 낮음).\n"
+            "  - 코호트 내 t2_peak / spe_peak 분포 분석 → anomaly run 찾기.\n"
+            "\n"
+            "Raw 시계열 + PCA score 배열 raw가 필요하면 get_timeseries(table='oes_runs', row_id=N)."
+        ),
+        "key_columns": [
+            "started_at", "sputter_auto_main_id", "n_peaks_detected",
+            "pca_cum_variance", "pca_valid", "t2_peak", "spe_peak",
+        ],
     },
 }
 
@@ -364,7 +476,7 @@ def run(table: str | None = None) -> dict[str, Any]:
 
 
 def _describe_all() -> dict[str, Any]:
-    """전체 테이블 요약 (vo2 11개 + equipment 7개 = 18개)."""
+    """전체 테이블 요약 (vo2 13개 + equipment 7개 = 20개)."""
     table_summaries = []
 
     with reader_session() as s:
@@ -415,7 +527,11 @@ def _describe_all() -> dict[str, Any]:
             "source_files.id ← sputter_runs_auto_main.source_file_id (SET NULL)",
             "source_files.id ← sputter_runs_auto_plasma.source_file_id (SET NULL)",
             "source_files.id ← rga_runs.source_file_id",
+            "source_files.id ← oes_runs.source_file_id",
+            "sputter_runs_auto_main.id ← oes_runs.sputter_auto_main_id (nearest within ±30min, NULL 허용)",
             "measurements: NO FK — 자체 트리 traversal로 적재, file_path UNIQUE",
+            "measurement_summary: NO FK — 자체 트리 traversal로 적재, (file_path, sha256, sample_id) UNIQUE",
+            "measurements ↔ measurement_summary: file_dir 99.7% 공유하나 sample-level 매핑 규칙 없음 (1.3%만 자연 매칭).",
             "equipment.equipments.id ← equipment.equipment_logs.equipment_id (외부 앱 FK)",
             "equipment.equipment_logs.id ← equipment.equipment_photos.log_id",
             "equipment.equipment_logs.id ← equipment.equipment_log_entries.log_id",
@@ -427,7 +543,7 @@ def _describe_all() -> dict[str, Any]:
             "describe_schema(table='ald_ncd_runs') 또는 "
             "describe_schema(table='equipment_logs') 형태로 호출. "
             "분석 SQL은 run_sql(sql='SELECT ...'). "
-            "시계열 raw 배열은 get_timeseries(table='measurements'|'rga_runs', row_id=N)."
+            "시계열 raw 배열은 get_timeseries(table='measurements'|'rga_runs'|'oes_runs', row_id=N)."
         ),
     }
 

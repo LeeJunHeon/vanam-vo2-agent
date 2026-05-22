@@ -67,7 +67,7 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
     Args:
         table: 조회할 테이블. bare name이면 스키마 자동 추론 (예: 'measurements', 'equipment_logs').
             'vo2.X' / 'equipment.X' 형태로 명시 가능.
-            None이면 전체 18개 테이블 요약 + 도메인 overview + sample 매핑 가이드
+            None이면 전체 20개 테이블 요약 + 도메인 overview + sample 매핑 가이드
             + 자주 쓰는 쿼리 예시.
 
     사용 가능 테이블:
@@ -75,7 +75,7 @@ def describe_schema(table: str | None = None) -> dict[str, Any]:
         source_files, etl_runs, mcp_audit_logs, parse_errors,
         ald_ncd_runs, ald_rayvac_runs,
         sputter_runs_human, sputter_runs_auto_main, sputter_runs_auto_plasma,
-        measurements, rga_runs
+        measurements, rga_runs, measurement_summary, oes_runs
 
         [equipment 스키마 — 장비 유지보수 (read-only)]
         equipments, equipment_logs, equipment_log_entries,
@@ -141,10 +141,10 @@ def run_sql(sql: str, max_rows: int = 100) -> dict[str, Any]:
     )
 )
 def get_timeseries(
-    table: Literal["measurements", "rga_runs"],
+    table: Literal["measurements", "rga_runs", "oes_runs"],
     row_id: int,
 ) -> dict[str, Any]:
-    """measurements/rga_runs 한 row의 시계열 배열 raw + 메타데이터 + 통계.
+    """measurements/rga_runs/oes_runs 한 row의 시계열 배열 raw + 메타데이터 + 통계.
 
     한 번에 한 row만 (토큰 폭발 방지).
 
@@ -158,12 +158,19 @@ def get_timeseries(
         intensity[i] = Mass (i+1)의 값.
         notable_masses에 주요 mass (H2O, N2, O2, Ar 등) 미리 highlight.
 
+    table='oes_runs':
+        한 sputter run의 OES 9단계 파이프라인 결과 (raw 1014ch×~1000timestep 미저장).
+        peak_wavelengths_nm[] + peak_intensities[] (같은 인덱스 짝) + pca_explained_variance_ratio[].
+        summary.pca / summary.spc에 Hotelling T² / SPE 통계 포함.
+        notable_lines에 Ar I / O I / V I 등 주요 emission line annotation.
+
     Args:
-        table: 'measurements' 또는 'rga_runs'
+        table: 'measurements' / 'rga_runs' / 'oes_runs'
         row_id: 해당 테이블의 id 컬럼 값. run_sql로 id 미리 조회 가능.
 
     Returns:
-        {table, row_id, metadata, data: {배열들}, summary: {통계}, info, notable_masses?}
+        {table, row_id, metadata, data: {배열들}, summary: {통계}, info,
+         notable_masses? (rga), notable_lines? (oes)}
     """
     return _ts_tool.run(table=table, row_id=row_id)
 
