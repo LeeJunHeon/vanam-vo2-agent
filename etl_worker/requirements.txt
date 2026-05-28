@@ -10,3 +10,6 @@ apscheduler>=3.10,<4.0
 # OES PCA pipeline (Phase 4 Step 25)
 scipy>=1.11,<2.0
 scikit-learn>=1.3,<2.0
+
+# OES baseline v2.0 — ALS (asymmetric least squares) on mean spectrum
+pybaselines>=1.1,<2.0

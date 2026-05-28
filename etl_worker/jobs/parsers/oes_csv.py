@@ -34,6 +34,7 @@ from typing import Optional, Any
 
 import numpy as np
 import pandas as pd
+from pybaselines import Baseline
 from scipy.signal import find_peaks
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
@@ -45,12 +46,20 @@ from etl_worker.jobs.scan_files import SourceFileRecord
 log = logging.getLogger("etl.parsers.oes_csv")
 
 # ───── 파이프라인 상수 ─────
-PIPELINE_VERSION = "v1.0"
+# v2.0: baseline 알고리즘을 percentile-5 → ALS 로 교체 (Decisions.md 2026-05-28 참조).
+# 실제 OES csv 는 plasma 가 99.8% 시간 ON 이라 OFF 구간이 거의 없음.
+# 기존 percentile_5_per_channel 은 OFF 구간이 있다는 가정이라 signal floor 를
+# baseline 으로 잡아버려 실제 신호를 깎아냄 (SNR 2~3). ALS 는 wavelength 축의
+# continuum 을 따라가므로 peak amplitude 를 보존 (SNR 200~600).
+PIPELINE_VERSION = "v2.0"
 
 PLASMA_ON_METHOD = "total_intensity_midpoint"
-BASELINE_METHOD = "percentile_5_per_channel"
-PEAK_PROMINENCE = 10.0
+BASELINE_METHOD = "asls_on_mean_spectrum"
+BASELINE_LAM = 1e5    # ALS smoothness — 클수록 baseline 이 더 평평
+BASELINE_P = 0.001    # ALS asymmetry — 작을수록 peak 아래로 덜 끌려감
+PEAK_PROMINENCE = 50.0  # ALS 후 신호 진폭이 커져 prominence 상향 (was 10.0)
 PEAK_DISTANCE = 2
+PEAK_TOP_N = 20       # prominence 통과 peak 중 intensity 상위 N 개만 사용
 INTEGRATION_BAND = 2
 
 SCALING_METHOD = "minmax_per_peak"
@@ -290,17 +299,35 @@ def parse_oes_csv(record: SourceFileRecord) -> dict:
         _update_source_metadata(record.id, {}, 0, "error", msg)
         return {"status": "error", "reason": msg, "inserted": 0}
 
-    # Step 4: Baseline 제거
-    baseline = np.percentile(X_on, 5, axis=0)
-    X_bc = X_on - baseline
+    # Step 4: Baseline 제거 (ALS on mean spectrum, wavelength axis)
+    # plasma 가 거의 항상 ON 이므로 시간축 percentile 대신 wavelength 축 continuum 을 ALS 로 추정.
+    mean_spec_raw = X_on.mean(axis=0)
+    try:
+        bl = Baseline(x_data=np.arange(len(mean_spec_raw)))
+        baseline_curve, _ = bl.asls(mean_spec_raw, lam=BASELINE_LAM, p=BASELINE_P)
+    except Exception as e:
+        msg = f"baseline_failed: {type(e).__name__}: {e}"
+        log.exception(f"OES {record.file_name}: ALS baseline failed")
+        _update_source_metadata(record.id, {}, 0, "error", msg)
+        return {"status": "error", "reason": msg, "inserted": 0}
 
-    # Step 5: Peak 검출
+    X_bc = X_on - baseline_curve[np.newaxis, :]
+    baseline = baseline_curve  # downstream baseline_min/max/median 계산용
+
+    # Step 5: Peak 검출 + top-N intensity 필터
     mean_spec = X_bc.mean(axis=0)
-    peaks, _ = find_peaks(
+    peaks_all, _ = find_peaks(
         mean_spec,
         prominence=PEAK_PROMINENCE,
         distance=PEAK_DISTANCE,
     )
+    # prominence 통과 peak 이 많으면 mean intensity 상위 PEAK_TOP_N 개만 (wavelength 순 정렬 유지)
+    if len(peaks_all) > PEAK_TOP_N:
+        intensities = mean_spec[peaks_all]
+        top_idx = np.argsort(intensities)[::-1][:PEAK_TOP_N]
+        peaks = np.sort(peaks_all[top_idx])
+    else:
+        peaks = peaks_all
     n_peaks = len(peaks)
 
     if n_peaks < PCA_N_COMPONENTS:
