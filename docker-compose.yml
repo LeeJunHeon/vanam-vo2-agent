@@ -20,7 +20,7 @@ services:
       # ALD 장비 데이터 (NCD + Rayvac)
       - /volume1/VanaM_ALD:/data_ald:ro
       # VO2 측정 데이터 (.dat 트리)
-      - /volume1/VanaM_VO2:/data_vo2:ro
+      - /volume1/VanaM_Measurement/VO2:/data_vo2:ro
     logging:
       driver: json-file
       options:

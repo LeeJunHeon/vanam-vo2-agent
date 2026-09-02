@@ -31,7 +31,7 @@ log = logging.getLogger("etl.scan_files")
 # 마운트 매핑 (docker-compose volumes):
 #   /data       ← /volume1/VanaM_Sputter
 #   /data_ald   ← /volume1/VanaM_ALD
-#   /data_vo2   ← /volume1/VanaM_VO2
+#   /data_vo2   ← /volume1/VanaM_Measurement/VO2
 #
 # 측정 .dat (5번)은 폴더 트리 traversal이 필요해 별도 파서 (measurement_dat).
 # SOURCE_FILES는 단일 파일 인덱싱만 다루므로 측정은 여기서 제외, Step 17에서 처리.

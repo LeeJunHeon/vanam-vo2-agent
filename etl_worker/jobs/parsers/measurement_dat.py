@@ -50,7 +50,7 @@ from shared.db import session_scope_writer
 
 log = logging.getLogger("etl.parsers.measurement_dat")
 
-# 마운트 매핑: /volume1/VanaM_VO2 → /data_vo2:ro (docker-compose)
+# 마운트 매핑: /volume1/VanaM_Measurement/VO2 → /data_vo2:ro (docker-compose)
 MEASUREMENT_ROOT = "/data_vo2/VO2 data (NAS)/data"
 
 # 파일명 정규식
