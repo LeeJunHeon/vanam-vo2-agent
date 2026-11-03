@@ -2,6 +2,10 @@ name: vo2-agent
 
 services:
   vo2-etl-worker:
+    # GitHub Actions 가 올린 이미지를 deploy 스크립트가 :deployed 로 태그한다(compose 가 스스로 받지 않음).
+    # build 는 비상용(sudo ./deploy*.sh --build)으로 남겨 둔다
+    image: ghcr.io/leejunheon/vo2-etl-worker:deployed
+    pull_policy: never
     build:
       context: .
       dockerfile: etl_worker/Dockerfile
@@ -28,6 +32,10 @@ services:
         max-file: "5"
 
   vo2-mcp-server:
+    # GitHub Actions 가 올린 이미지를 deploy 스크립트가 :deployed 로 태그한다(compose 가 스스로 받지 않음).
+    # build 는 비상용(sudo ./deploy*.sh --build)으로 남겨 둔다
+    image: ghcr.io/leejunheon/vo2-mcp-server:deployed
+    pull_policy: never
     build:
       context: .
       dockerfile: mcp_server/Dockerfile

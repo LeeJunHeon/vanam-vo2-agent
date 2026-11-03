@@ -22,6 +22,23 @@ Synology NAS의 Docker 컨테이너로 배포되는 Python ETL/MCP 서비스.
 - 포털: `portal-nextjs` 의 `/vo2` 라우트로 통합 (Phase 1)
 - 외부 노출: Phase 3에서 `vo2-mcp.vanam.synology.me` (보안 hardening 후)
 
+## 배포 (NAS)
+
+이미지는 NAS 에서 빌드하지 않는다. main 에 push 하면 GitHub Actions(`.github/workflows/docker-publish.yml`)가 이미지를 빌드해
+이미지 두 개(`ghcr.io/leejunheon/vo2-etl-worker`·`vo2-mcp-server`, 태그 `<커밋 SHA>`·`:latest`) 로 올리고, NAS 는 그 이미지를 받아 재시작만 한다.
+
+1. push 뒤 Actions 가 성공했는지 본다: https://github.com/LeeJunHeon/vanam-vo2-agent/actions
+2. NAS `/volume1/docker/vo2-agent` 에서 `sudo bash deploy.sh [서비스...]`(서비스를 안 주면 둘 다) — git pull → 그 커밋 이미지 받기 → `:deployed` 로 바꾸기 → `docker compose up -d` → 실행 확인 → 옛 이미지 정리.
+   그 커밋 이미지가 아직 없으면(빌드 중·실패·로그인 안 됨) Actions 주소를 안내하고 아무것도 바꾸지 않은 채 멈춘다.
+3. 문제가 있으면 `rollback` 인자 — 바로 전 이미지(`:previous`)와 맞바꾼다(git pull 하지 않음).
+4. GitHub 을 쓸 수 없을 때만 `--build` 인자(비상용) — 예전처럼 NAS 에서 직접 빌드해 `:deployed` 로 쓴다.
+- 인자 예: `sudo bash deploy.sh rollback vo2-mcp-server`, `sudo bash deploy.sh --build vo2-etl-worker`. 정지는 지금처럼 synowebapi 로 한다(DSM 알림 회피).
+
+- 처음 한 번: NAS 에서 `sudo git pull`(새 배포 스크립트 받기) → `sudo docker login ghcr.io`(GitHub 사용자 이름 + `read:packages` 권한
+  토큰. 공개 저장소 이미지는 로그인 없이도 받을 수 있다) → 배포. 처음에는 `:previous` 가 없어 되돌리기는 `--build` 로 한다.
+- 배포 기록은 앱 폴더의 `.deploy-state`(git 에 넣지 않음)에 이미지마다 현재·이전 커밋 SHA 와 시각으로 남는다. 공용 함수는 `scripts/ghcr-deploy.sh`.
+- 예전에 NAS 에서 빌드한 이미지(compose 기본 이름)는 자동으로 지우지 않는다. `sudo docker images` 로 확인해 쓰지 않는 것만 지운다.
+
 ## 자세한 문서
 
 설계, 의사결정, 배포 절차, ETL/MCP 상세는 운영자의 Obsidian vault `01_Projects/VO2_Agent/` 참조.

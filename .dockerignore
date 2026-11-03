@@ -39,3 +39,9 @@ Thumbs.db
 
 # analysis-worker는 Phase 2 이후 빌드 대상이라 현재 컨텍스트에서 제외
 analysis_worker/
+
+# 비밀값·배포 기록·배포 스크립트 — 이미지에 넣지 않는다
+.env.*
+.deploy-state
+scripts
+.github
