@@ -47,6 +47,9 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
       - name: 빌드·푸시 (${{ matrix.image }})
         uses: docker/build-push-action@v7
+        # 빌드 기록 artifact(.dockerbuild)를 Actions 에 올리지 않는다(쓰지 않는 기록이 쌓이지 않게)
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
