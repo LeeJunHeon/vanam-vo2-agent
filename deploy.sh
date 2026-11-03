@@ -78,6 +78,8 @@ if [ "$GHCR_MODE" = "rollback" ]; then
     echo "[1/4] 되돌리기 (git pull 안 함)"
 else
     echo "[1/4] git pull..."
+    # NAS 폴더가 main 이 아니면 아무것도 바꾸지 않고 멈춘다(공용 함수)
+    ghcr_require_main
     git pull
 fi
 

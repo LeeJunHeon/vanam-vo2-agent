@@ -214,6 +214,17 @@ ghcr_cleanup() {
   docker image prune -f --filter "label=org.opencontainers.image.source=https://github.com/${GHCR_REPO}" >/dev/null 2>&1 || true
 }
 
+# NAS 폴더가 main 브랜치일 때만 배포한다(git pull 전에 부른다, --build 도 같다). 다른 브랜치면 아무것도 바꾸지 않고 종료 1.
+# rollback 은 git 을 쓰지 않으므로 보지 않는다.
+ghcr_require_main() {
+  local branch
+  branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  if [ "$branch" != "main" ]; then
+    echo "NAS 폴더가 $branch 에 있습니다. main 만 배포합니다: sudo git checkout main 후 다시 실행" >&2
+    exit 1
+  fi
+}
+
 # 실패했을 때 되돌리기 안내
 ghcr_rollback_hint() {
   local image
@@ -256,6 +267,7 @@ ghcr_standard_main() {
       echo "      safe.directory 추가: $APP_DIR"
       git config --global --add safe.directory "$APP_DIR"
     fi
+    ghcr_require_main
     # NAS 에서 직접 고친 추적 파일이 있으면 멈춘다 (추적하지 않는 새 파일은 괜찮다)
     if [ "${GHCR_CHECK_LOCAL_CHANGES:-0}" = "1" ] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
       echo "배포 중단: NAS 에서 직접 고친 파일이 있습니다"
