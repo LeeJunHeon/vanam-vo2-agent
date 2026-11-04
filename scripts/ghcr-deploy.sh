@@ -14,15 +14,30 @@
 #   build    : (비상용, --build) GitHub 을 쓰지 않고 NAS 에서 docker compose build 해 :deployed 로 쓴다(:previous 는 보관)
 #
 # NAS 보호(서비스 반영 속도보다 먼저다 — 배포 직후 옛 이미지 삭제·btrfs 정리·메모리 고갈이 겹쳐 NAS 가 멈춘 적이 있다)
-#   배포 입구마다 git pull 전에 ghcr_begin 을 부르고, 끝날 때(정상·오류) trap 으로 ghcr_end 가 되돌린다.
-#   - 동시 배포 금지: /tmp/vanam-deploy.lock 디렉터리(mkdir)를 잠금으로 써서 한 번에 한 앱만 배포한다.
-#     잠금을 못 잡으면 종료 1. 60분 넘은 잠금은 남은 것으로 보고 정리한 뒤 진행한다.
+#   배포 입구마다 git pull 전에 ghcr_begin(trap → 잠금 → 상태 점검)을 부르고, 끝날 때(정상·오류·신호) trap 으로 ghcr_end 가 잠금을 푼다.
 #   - 상태 점검: 1분 평균 부하(/proc/loadavg)가 LOAD_MAX 초과이거나 MemAvailable(/proc/meminfo)이 MEM_MIN_MB 미만이면
-#     현재 값을 보여 주고 시작하지 않는다(종료 1). 환경 변수 GHCR_FORCE=1 이면 이 점검만 건너뛴다
-#     (잠금·watchdog 일시 정지는 그대로). 사용법: sudo GHCR_FORCE=1 ./deploy.sh
-#   - watchdog 일시 정지: /volume1/docker 가 있으면 watchdog.pause 를 만든다(원래 없을 때만). 직접 만든 경우에만 끝날 때 지운다.
+#     현재 값을 보여 주고 시작하지 않는다(종료 1). 환경 변수 GHCR_FORCE=1 이면 이 점검만 건너뛴다(잠금은 그대로).
+#     사용법: sudo GHCR_FORCE=1 ./deploy.sh
+#   - 배포 중 신호는 배포 잠금 하나다. watchdog 은 살아 있는 배포 잠금이 있으면 쉰다(별도 신호 없음).
+#     watchdog.pause 는 사람이 점검할 때 쓰는 파일로 NAS 에 남는다 — 이 파일은 그것을 만들지도 지우지도 않는다.
 #   - 옛 이미지는 배포 중에 지우지 않는다(새벽 야간 정리 작업이 맡는다). :deployed·:previous 는 rollback 용으로 늘 남는다.
 #   - git 출력은 pager 를 쓰지 않는다(GIT_PAGER=cat — NAS 에는 less 가 없다).
+#
+# 배포 잠금 규칙(NAS 의 watchdog·야간 정리 스크립트도 같은 규칙으로 읽는다)
+#   1. 잠금 = mkdir /tmp/vanam-deploy.lock (원자적). 잡은 직후 그 안에 owner 파일을 임시 파일에 쓴 뒤 mv 로 바꿔 넣는다.
+#      형식(한 줄에 key=value, 이 순서):
+#        pid=<잠금을 잡은 bash 의 $$>
+#        boot=<cat /proc/sys/kernel/random/boot_id, 못 읽으면 unknown>
+#        started=<date +%s>
+#        by=<$0>
+#   2. 살아 있는 잠금 판정(ghcr_lock_alive 잠금폴더):
+#      - owner 파일이 없거나 pid 를 못 읽으면: 잠금 폴더 mtime 이 120초 이내면 살아 있음(막 만든 직후), 아니면 죽은 잠금.
+#      - boot 가 unknown 이 아니고 현재 boot_id 와 다르면 죽은 잠금(재부팅됨).
+#      - /proc/<pid> 가 없으면 죽은 잠금. 있으면 살아 있음. (kill -0 은 권한 문제로 쓰지 않는다)
+#   3. mkdir 이 실패하면 살아 있는지 본다. 죽은 잠금이면 owner 내용을 로그로 남기고 지운 뒤 한 번 다시 mkdir.
+#      살아 있으면 "다른 배포(또는 야간 정리)가 진행 중입니다" 와 owner(pid·시작 시각·by)를 보여 주고 시작하지 않는다(종료 1).
+#   4. 시간만으로(예: 60분) 잠금을 정리하지 않는다.
+#   5. 푸는 쪽은 자기가 잡은 잠금만 푼다(owner 의 pid 가 자기 $$ 일 때만 지운다).
 #
 # source 하기 전에 정하는 값
 #   GHCR_REPO      GitHub 저장소(LeeJunHeon/xxx) — 안내 주소와 옛 이미지 정리(라벨)에 쓴다
@@ -39,12 +54,13 @@
 LOAD_MAX=6       # 1분 평균 부하 상한
 MEM_MIN_MB=500   # 여유 메모리(MemAvailable) 하한(MB)
 
-GHCR_LOCK_DIR="${GHCR_LOCK_DIR:-/tmp/vanam-deploy.lock}"  # 동시 배포 잠금(모든 앱이 같이 쓴다)
-GHCR_LOCK_MAX_SECONDS=3600                                # 이보다 오래된 잠금은 남은 것으로 본다(60분)
-GHCR_DOCKER_ROOT="${GHCR_DOCKER_ROOT:-/volume1/docker}"   # watchdog.pause 가 있는 곳
+GHCR_LOCK_DIR="${GHCR_LOCK_DIR:-/tmp/vanam-deploy.lock}"  # 배포 잠금(모든 앱·야간 정리가 같이 쓴다)
+GHCR_LOCK_FRESH_SECONDS=120                               # owner 가 없는 잠금을 '막 만든 것'으로 보는 시간
+# 시험에서 바꿀 수 있는 /proc 위치(살아 있는 pid 확인, 부팅 id)
+GHCR_PROC_DIR="${GHCR_PROC_DIR:-/proc}"
+GHCR_BOOT_ID_FILE="${GHCR_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 GHCR_FORCE="${GHCR_FORCE:-0}"
 GHCR_LOCK_HELD=0     # 이 실행이 잠금을 잡았는지(잡은 경우에만 푼다)
-GHCR_PAUSE_CREATED=0 # 이 실행이 watchdog.pause 를 만들었는지(만든 경우에만 지운다)
 
 # git 이 pager(less)를 부르지 않게 한다(NAS 에 less 가 없어 "cannot run less" 가 났다)
 export GIT_PAGER=cat
@@ -67,7 +83,7 @@ ghcr_compose() {
   fi
 }
 
-# ───────── NAS 보호: ghcr_begin(잠금 → 상태 점검 → watchdog 일시 정지) / ghcr_end(되돌리기) ─────────
+# ───────── NAS 보호: ghcr_begin(trap → 잠금 → 상태 점검) / ghcr_end(이 실행이 잡은 잠금만 풀기) ─────────
 
 # NAS 상태 값 — 시험에서는 이 두 함수를 다시 정의해 가짜 값을 넣는다
 ghcr_read_load() {
@@ -77,31 +93,83 @@ ghcr_read_mem_kb() {
   awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true
 }
 
-# 동시 배포 잠금. 다른 배포가 잡고 있으면 0 이 아닌 값. 60분 넘은 잠금은 남은 것으로 보고 정리한 뒤 다시 잡는다.
+# 지금 부팅의 id(못 읽으면 unknown)
+ghcr_boot_id() {
+  local id
+  id="$(cat "$GHCR_BOOT_ID_FILE" 2>/dev/null || true)"
+  echo "${id:-unknown}"
+}
+
+# owner 파일의 값 하나(key=value). 없으면 빈 값
+ghcr_owner_get() {
+  awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null || true
+}
+
+# 잠금을 잡은 쪽 설명(pid·시작 시각·by)
+ghcr_lock_describe() {
+  local owner="$1/owner" pid started by when
+  if [ ! -f "$owner" ]; then
+    echo "  (잠금 $1: owner 정보 없음)"
+    return 0
+  fi
+  pid="$(ghcr_owner_get "$owner" pid)"
+  started="$(ghcr_owner_get "$owner" started)"
+  by="$(ghcr_owner_get "$owner" by)"
+  when="$(date -d "@${started:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "${started:-?}")"
+  echo "  (잠금 $1: pid ${pid:-?}, 시작 $when, by ${by:-?})"
+}
+
+# 살아 있는 잠금이면 0(규칙 2) — owner 없음·pid 못 읽음은 폴더 mtime 120초 이내만, 부팅이 바뀌었거나 /proc/<pid> 가 없으면 죽은 잠금
+ghcr_lock_alive() {
+  local dir="$1" owner="$1/owner" pid boot now mtime
+  pid="$(ghcr_owner_get "$owner" pid)"
+  case "$pid" in
+    "" | *[!0-9]*)
+      now="$(date +%s)"
+      mtime="$(stat -c %Y "$dir" 2>/dev/null || echo 0)"
+      [ $((now - mtime)) -le "$GHCR_LOCK_FRESH_SECONDS" ]
+      return
+      ;;
+  esac
+  boot="$(ghcr_owner_get "$owner" boot)"
+  if [ -n "$boot" ] && [ "$boot" != "unknown" ] && [ "$boot" != "$(ghcr_boot_id)" ]; then
+    return 1
+  fi
+  [ -d "$GHCR_PROC_DIR/$pid" ]
+}
+
+# 잡은 직후 owner 를 임시 파일에 쓰고 mv 로 바꿔 넣는다(읽는 쪽이 반쯤 쓴 파일을 보지 않게)
+ghcr_write_owner() {
+  local tmp="$GHCR_LOCK_DIR/owner.tmp.$$"
+  printf 'pid=%s\nboot=%s\nstarted=%s\nby=%s\n' "$$" "$(ghcr_boot_id)" "$(date +%s)" "$0" >"$tmp" &&
+    mv -f "$tmp" "$GHCR_LOCK_DIR/owner"
+}
+
+# 배포 잠금(규칙 1·3). 살아 있는 다른 잠금이 있으면 안내하고 1. 죽은 잠금은 owner 를 남기고 지운 뒤 한 번 다시 잡는다.
 ghcr_lock() {
-  local now mtime
   if ! mkdir "$GHCR_LOCK_DIR" 2>/dev/null; then
-    now="$(date +%s)"
-    mtime="$(stat -c %Y "$GHCR_LOCK_DIR" 2>/dev/null || echo "$now")"
-    if [ $((now - mtime)) -gt "$GHCR_LOCK_MAX_SECONDS" ]; then
-      ghcr_log "60분 넘게 남은 잠금을 정리합니다: $GHCR_LOCK_DIR ($(cat "$GHCR_LOCK_DIR/owner" 2>/dev/null || echo 정보 없음))"
-      rm -rf "$GHCR_LOCK_DIR"
+    if ghcr_lock_alive "$GHCR_LOCK_DIR"; then
+      echo "다른 배포(또는 야간 정리)가 진행 중입니다. 끝난 뒤 다시 실행하세요" >&2
+      ghcr_lock_describe "$GHCR_LOCK_DIR" >&2
+      return 1
     fi
+    ghcr_log "죽은 잠금을 정리합니다: $(tr '\n' ' ' 2>/dev/null <"$GHCR_LOCK_DIR/owner" || echo "owner 없음")"
+    rm -rf "$GHCR_LOCK_DIR"
     if ! mkdir "$GHCR_LOCK_DIR" 2>/dev/null; then
-      echo "다른 앱 배포가 진행 중입니다. 끝난 뒤 다시 실행하세요" >&2
-      echo "  (잠금 $GHCR_LOCK_DIR: $(cat "$GHCR_LOCK_DIR/owner" 2>/dev/null || echo 정보 없음))" >&2
+      echo "다른 배포(또는 야간 정리)가 진행 중입니다. 끝난 뒤 다시 실행하세요" >&2
+      ghcr_lock_describe "$GHCR_LOCK_DIR" >&2
       return 1
     fi
   fi
   GHCR_LOCK_HELD=1
-  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') pid $$ $0" >"$GHCR_LOCK_DIR/owner" 2>/dev/null || true
+  ghcr_write_owner
 }
 
 # 배포 전 NAS 상태 점검(GHCR_FORCE=1 이면 건너뜀). 부하가 LOAD_MAX 초과이거나 여유 메모리가 MEM_MIN_MB 미만이면 0 이 아닌 값.
 ghcr_check_health() {
   local load mem_kb mem_mb
   if [ "$GHCR_FORCE" = "1" ]; then
-    ghcr_log "GHCR_FORCE=1: NAS 상태 점검을 건너뜁니다(잠금·watchdog 일시 정지는 그대로)"
+    ghcr_log "GHCR_FORCE=1: NAS 상태 점검을 건너뜁니다(잠금은 그대로)"
     return 0
   fi
   load="$(ghcr_read_load)"
@@ -119,40 +187,27 @@ ghcr_check_health() {
   ghcr_log "NAS 상태 정상: 1분 평균 부하 $load, 여유 메모리 ${mem_mb}MB"
 }
 
-# watchdog 일시 정지 파일을 만든다(원래 없을 때만, /volume1/docker 가 없으면 조용히 건너뜀)
-ghcr_pause_watchdog() {
-  local pause="$GHCR_DOCKER_ROOT/watchdog.pause"
-  [ -d "$GHCR_DOCKER_ROOT" ] || return 0
-  if [ -e "$pause" ]; then
-    ghcr_log "watchdog 은 이미 일시 정지 상태입니다(원래 있던 $pause 는 그대로 둔다)"
-    return 0
-  fi
-  if : >"$pause" 2>/dev/null; then
-    GHCR_PAUSE_CREATED=1
-    ghcr_log "watchdog 일시 정지: $pause (끝나면 지운다)"
-  fi
-}
-
 # 배포 시작 점검 — 모든 배포 입구에서 git pull 전에(root 로 다시 실행된 뒤) 부른다.
-# 잠금 → 상태 점검 → watchdog 일시 정지. 막히면 이미 잡은 것만 정리하고 종료 1. 끝날 때는 trap 으로 ghcr_end.
+# trap → 잠금 → 상태 점검. 막히면 이미 잡은 것만 정리하고 종료 1. 끝날 때는 trap 으로 ghcr_end.
+# 신호(TERM·INT·HUP)로 끝나도 EXIT trap 이 돌도록 신호를 종료로 바꾼다.
 # (실행 스크립트가 나중에 trap ... EXIT 를 다시 걸 때는 그 trap 에 ghcr_end 를 함께 넣어야 한다)
 ghcr_begin() {
   trap ghcr_end EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
   if ! ghcr_lock || ! ghcr_check_health; then
     ghcr_end
     exit 1
   fi
-  ghcr_pause_watchdog
 }
 
-# 정리: 직접 만든 watchdog.pause 만 지우고 잡은 잠금을 푼다. 여러 번 불려도 안전하다(종료 코드는 바꾸지 않는다).
+# 정리: 이 실행이 잡은 잠금만 푼다(owner 의 pid 가 자기 $$ 일 때만 지운다). 여러 번 불려도 안전하다(종료 코드는 바꾸지 않는다).
 ghcr_end() {
-  if [ "$GHCR_PAUSE_CREATED" = "1" ]; then
-    rm -f "$GHCR_DOCKER_ROOT/watchdog.pause" 2>/dev/null || true
-    GHCR_PAUSE_CREATED=0
-  fi
   if [ "$GHCR_LOCK_HELD" = "1" ]; then
-    rm -rf "$GHCR_LOCK_DIR" 2>/dev/null || true
+    if [ "$(ghcr_owner_get "$GHCR_LOCK_DIR/owner" pid)" = "$$" ]; then
+      rm -rf "$GHCR_LOCK_DIR" 2>/dev/null || true
+    fi
     GHCR_LOCK_HELD=0
   fi
 }
@@ -357,7 +412,7 @@ ghcr_standard_main() {
 
   cd "$APP_DIR" || exit 1
 
-  # NAS 보호: 동시 배포 잠금 → 상태 점검(GHCR_FORCE=1 이면 건너뜀) → watchdog 일시 정지 (끝나면 trap 이 ghcr_end)
+  # NAS 보호: 배포 잠금 → 상태 점검(GHCR_FORCE=1 이면 건너뜀). 배포 중에는 잠금으로 watchdog 이 쉰다(끝나면 trap 이 ghcr_end)
   ghcr_begin
 
   if [ "$GHCR_MODE" = "rollback" ]; then
