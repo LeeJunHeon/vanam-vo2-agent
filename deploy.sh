@@ -14,6 +14,10 @@
 #   sudo bash deploy.sh --build [서비스...]             # (비상용) GitHub 없이 NAS 에서 직접 빌드
 # 처음 한 번 NAS 에서: sudo docker login ghcr.io (공개 저장소 이미지면 로그인 없이도 받을 수 있다)
 #
+# NAS 보호(공용 함수 ghcr_begin/ghcr_end): 다른 앱 배포 중이면 멈춘다(한 번에 한 앱), NAS 부하·여유 메모리가 기준을 넘으면
+# 시작하지 않는다(sudo GHCR_FORCE=1 bash deploy.sh 로만 건너뜀), 배포하는 동안 watchdog 을 일시 정지한다.
+# 옛 이미지는 지우지 않는다(새벽 야간 정리 작업이 맡는다).
+#
 # - synowebapi로 정지하여 DSM 알림 회피
 # - 새 서비스 추가 시 SERVICES_AVAILABLE 배열과 워크플로 matrix 에 추가하면 됨(이미지 이름 = 서비스 이름)
 
@@ -67,6 +71,9 @@ for SERVICE in "${SERVICES[@]}"; do
     GHCR_IMAGES+=("ghcr.io/leejunheon/$SERVICE")
 done
 
+# NAS 보호(공용 함수): 동시 배포 잠금 → 상태 점검(GHCR_FORCE=1 이면 건너뜀) → watchdog 일시 정지. 끝나면 trap 이 ghcr_end
+ghcr_begin
+
 echo "=========================================="
 echo "[vo2-agent] 배포 시작 ($GHCR_MODE)"
 echo "대상 서비스: ${SERVICES[*]}"
@@ -100,7 +107,7 @@ for SERVICE in "${SERVICES[@]}"; do
     sudo docker compose up -d "$SERVICE"
 done
 
-# 옛 이미지 정리(이 앱 이미지 중 :deployed·:previous 가 아닌 것)
+# 옛 이미지는 지우지 않는다(안내만 — 새벽 야간 정리 작업 담당)
 ghcr_cleanup
 
 echo ""
